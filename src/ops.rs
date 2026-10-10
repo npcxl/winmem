@@ -144,6 +144,11 @@ pub struct TrimResult {
 
 /// 释放单个进程的工作集（把不活跃页面换出到待机列表）。
 pub fn trim_process(pid: u32, name: &str) -> TrimResult {
+    trim_process_with(pid, name, 40)
+}
+
+/// 同上，可自定义释放后等待毫秒数（GUI 批量操作时可调小以加快速度）。
+pub fn trim_process_with(pid: u32, name: &str, wait_ms: u64) -> TrimResult {
     let before = win::process_memory(pid).map(|m| m.WorkingSetSize as u64).unwrap_or(0);
 
     let mut h = win::open_process(pid, win::PROCESS_QUERY_LIMITED_INFORMATION | win::PROCESS_SET_QUOTA);
@@ -171,7 +176,9 @@ pub fn trim_process(pid: u32, name: &str) -> TrimResult {
         };
     }
 
-    std::thread::sleep(Duration::from_millis(40));
+    if wait_ms > 0 {
+        std::thread::sleep(Duration::from_millis(wait_ms));
+    }
     let after = win::process_memory(pid).map(|m| m.WorkingSetSize as u64).unwrap_or(0);
     TrimResult {
         pid,

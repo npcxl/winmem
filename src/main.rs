@@ -11,11 +11,10 @@
 #[cfg(not(windows))]
 compile_error!("winmem 仅支持 Windows 平台。");
 
-mod ops;
-mod ui;
-mod win;
+use winmem::ops::{self, SortBy};
+use winmem::term as ui;
+use winmem::win;
 
-use ops::SortBy;
 use std::collections::HashMap;
 use std::io::{self, Write};
 

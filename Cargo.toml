@@ -1,0 +1,20 @@
+[package]
+name = "winmem"
+version = "0.1.0"
+edition = "2021"
+description = "Windows 内存优化与进程内存栈管理工具"
+authors = ["winmem"]
+
+[[bin]]
+name = "winmem"
+path = "src/main.rs"
+
+# 零第三方依赖：直接绑定 Windows 原生 API
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

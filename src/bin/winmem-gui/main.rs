@@ -1569,7 +1569,7 @@ unsafe extern "system" fn wndproc(
         s.create_controls(hwnd, cs.hInstance);
         w32::SetTimer(hwnd, TIMER_ID, TIMER_MS, std::ptr::null());
         (*ptr).status =
-            "就绪 —— 点「一键优化」可立即回收内存；勾选进程后可单独释放内存或结束进程。"
+            "就绪 —— 「智能优化」按压力策略执行；勾选进程后可单独释放内存或结束进程；右键查看更多操作。"
                 .to_string();
         (*ptr).reload();
         return 0;

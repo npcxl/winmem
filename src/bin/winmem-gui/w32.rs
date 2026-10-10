@@ -1,5 +1,10 @@
 //! Win32 / GDI / Common Controls 原生绑定（GUI 专用，零第三方依赖）。
-#![allow(non_snake_case, non_camel_case_types, dead_code)]
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    dead_code,
+    clippy::upper_case_acronyms
+)]
 
 use std::ffi::c_void;
 
@@ -53,13 +58,29 @@ pub const WM_SETFONT: u32 = 0x0030;
 pub const WM_NOTIFY: u32 = 0x004E;
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_TIMER: u32 = 0x0113;
+pub const WM_CONTEXTMENU: u32 = 0x007B;
 pub const EN_CHANGE: u32 = 0x0300;
+
+// 弹出菜单
+pub const MF_STRING: u32 = 0x0000;
+pub const MF_SEPARATOR: u32 = 0x0800;
+pub const TPM_RETURNCMD: u32 = 0x0100;
+pub const TPM_RIGHTBUTTON: u32 = 0x0002;
+pub const SW_SHOWNORMAL: i32 = 1;
 pub const BN_CLICKED: u32 = 0;
 pub const EM_SETCUEBANNER: u32 = 0x1501;
 
 // ListView 通知
 pub const LVN_ITEMCHANGED: i32 = -101;
 pub const LVN_COLUMNCLICK: i32 = -108;
+pub const NM_CUSTOMDRAW: i32 = -12;
+
+// 自绘（Custom Draw）
+pub const CDDS_PREPAINT: u32 = 0x0000_0001;
+pub const CDDS_ITEMPREPAINT: u32 = 0x0001_0001;
+pub const CDRF_DODEFAULT: isize = 0x0000_0000;
+pub const CDRF_NOTIFYITEMDRAW: isize = 0x0000_0020;
+pub const CDIS_SELECTED: u32 = 0x0001;
 
 // ListView 样式与消息
 pub const LVS_REPORT: u32 = 0x0001;
@@ -78,6 +99,10 @@ pub const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = LVM_FIRST + 54;
 pub const LVM_INSERTITEMW: u32 = LVM_FIRST + 77;
 pub const LVM_INSERTCOLUMNW: u32 = LVM_FIRST + 97;
 pub const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
+pub const LVM_SETICONSPACING: u32 = LVM_FIRST + 53;
+
+// GDI 度量
+pub const LOGPIXELSY: i32 = 90;
 
 pub const LVIF_TEXT: u32 = 0x0001;
 pub const LVCF_FMT: u32 = 0x0001;
@@ -240,6 +265,35 @@ pub struct NMLISTVIEW {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct NMCUSTOMDRAW {
+    pub hdr: NMHDR,
+    pub dwDrawStage: u32,
+    pub hdc: HDC,
+    pub rc: RECT,
+    pub dwItemSpec: usize,
+    pub uItemState: u32,
+    pub lItemlParam: LPARAM,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NMLVCUSTOMDRAW {
+    pub nmcd: NMCUSTOMDRAW,
+    pub clrText: u32,
+    pub clrTextBk: u32,
+    pub iSubItem: i32,
+    pub dwItemType: u32,
+    pub clrFace: u32,
+    pub iIconEffect: i32,
+    pub iIconPhase: i32,
+    pub iPartId: i32,
+    pub iStateId: i32,
+    pub rcText: RECT,
+    pub uAlign: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct LVCOLUMNW {
     pub mask: UINT,
     pub fmt: i32,
@@ -311,7 +365,8 @@ unsafe extern "system" {
     pub fn DestroyWindow(hWnd: HWND) -> BOOL;
     pub fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> BOOL;
     pub fn UpdateWindow(hWnd: HWND) -> BOOL;
-    pub fn GetMessageW(lpMsg: *mut MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32) -> BOOL;
+    pub fn GetMessageW(lpMsg: *mut MSG, hWnd: HWND, wMsgFilterMin: u32, wMsgFilterMax: u32)
+        -> BOOL;
     pub fn TranslateMessage(lpMsg: *const MSG) -> BOOL;
     pub fn DispatchMessageW(lpMsg: *const MSG) -> LRESULT;
     pub fn PostQuitMessage(nExitCode: i32);
@@ -329,7 +384,8 @@ unsafe extern "system" {
     pub fn SetWindowTextW(hWnd: HWND, lpString: *const u16) -> BOOL;
     pub fn MessageBoxW(hWnd: HWND, lpText: *const u16, lpCaption: *const u16, uType: u32) -> i32;
     pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: BOOL) -> BOOL;
-    pub fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: u32, lpTimerFunc: *const c_void) -> usize;
+    pub fn SetTimer(hWnd: HWND, nIDEvent: usize, uElapse: u32, lpTimerFunc: *const c_void)
+        -> usize;
     pub fn KillTimer(hWnd: HWND, uIDEvent: usize) -> BOOL;
     pub fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) -> isize;
     pub fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) -> isize;
@@ -346,6 +402,36 @@ unsafe extern "system" {
     pub fn FillRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) -> i32;
     pub fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
     pub fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) -> BOOL;
+    pub fn GetDC(hWnd: HWND) -> HDC;
+    pub fn ReleaseDC(hWnd: HWND, hDC: HDC) -> i32;
+
+    // 弹出菜单（右键菜单）
+    pub fn CreatePopupMenu() -> HMENU;
+    pub fn AppendMenuW(hMenu: HMENU, uFlags: u32, uIDNewItem: usize, lpNewItem: *const u16)
+        -> BOOL;
+    pub fn TrackPopupMenu(
+        hMenu: HMENU,
+        uFlags: u32,
+        x: i32,
+        y: i32,
+        nReserved: i32,
+        hWnd: HWND,
+        prcRect: *const RECT,
+    ) -> i32;
+    pub fn DestroyMenu(hMenu: HMENU) -> BOOL;
+    pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
+}
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    pub fn ShellExecuteW(
+        hwnd: HWND,
+        lpOperation: *const u16,
+        lpFile: *const u16,
+        lpParameters: *const u16,
+        lpDirectory: *const u16,
+        nShowCmd: i32,
+    ) -> isize;
 }
 
 #[link(name = "gdi32")]
@@ -371,6 +457,10 @@ unsafe extern "system" {
     pub fn SelectObject(hdc: HDC, h: HGDIOBJ) -> HGDIOBJ;
     pub fn SetTextColor(hdc: HDC, color: u32) -> u32;
     pub fn SetBkMode(hdc: HDC, mode: i32) -> i32;
+    pub fn GetDeviceCaps(hdc: HDC, nIndex: i32) -> i32;
+    /// 创建圆角矩形区域（用于绘制 Win11 风格的圆角进度条）。
+    pub fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> HGDIOBJ;
+    pub fn FillRgn(hdc: HDC, hrgn: HGDIOBJ, hbr: HBRUSH) -> BOOL;
 }
 
 #[link(name = "comctl32")]
@@ -423,7 +513,11 @@ pub unsafe fn lv_add_column(lv: HWND, index: i32, title: &str, width: i32, right
     let mut text = w(title);
     let mut col = LVCOLUMNW::zeroed();
     col.mask = LVCF_FMT | LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM;
-    col.fmt = if right_align { LVCFMT_RIGHT } else { LVCFMT_LEFT };
+    col.fmt = if right_align {
+        LVCFMT_RIGHT
+    } else {
+        LVCFMT_LEFT
+    };
     col.cx = width;
     col.pszText = text.as_mut_ptr();
     col.cchTextMax = 0;
@@ -512,13 +606,7 @@ pub unsafe fn draw_text(hdc: HDC, s: &str, mut rc: RECT, format: u32, color: u32
     SetTextColor(hdc, color);
     SetBkMode(hdc, TRANSPARENT);
     let buf: Vec<u16> = s.encode_utf16().collect();
-    DrawTextW(
-        hdc,
-        buf.as_ptr(),
-        buf.len() as i32,
-        &mut rc,
-        format,
-    );
+    DrawTextW(hdc, buf.as_ptr(), buf.len() as i32, &mut rc, format);
     SelectObject(hdc, old);
 }
 
@@ -527,4 +615,36 @@ pub unsafe fn fill_rect(hdc: HDC, rc: &RECT, color: u32) {
     let brush = CreateSolidBrush(color);
     FillRect(hdc, rc, brush);
     DeleteObject(brush);
+}
+
+/// 填充圆角矩形（Win11 风格）。
+pub unsafe fn fill_round_rect(hdc: HDC, rc: &RECT, radius: i32, color: u32) {
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return;
+    }
+    let r = radius.max(1);
+    let rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, r * 2, r * 2);
+    if rgn == 0 {
+        fill_rect(hdc, rc, color);
+        return;
+    }
+    let brush = CreateSolidBrush(color);
+    FillRgn(hdc, rgn, brush);
+    DeleteObject(brush);
+    DeleteObject(rgn);
+}
+
+/// 取系统 DPI（96 表示 100% 缩放）。
+pub unsafe fn system_dpi() -> i32 {
+    let hdc = GetDC(0);
+    if hdc == 0 {
+        return 96;
+    }
+    let dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+    ReleaseDC(0, hdc);
+    if dpi <= 0 {
+        96
+    } else {
+        dpi
+    }
 }

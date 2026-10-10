@@ -1,6 +1,6 @@
-//! 终端输出：颜色、单位格式化、表格与进度条。
-
-use crate::ops::ProcInfo;
+//! 终端渲染工具：ANSI 颜色、进度条、表格原语。
+//!
+//! 只负责“怎么显示”，不含任何业务判断。
 
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
@@ -10,21 +10,46 @@ pub const GREEN: &str = "\x1b[32m";
 pub const YELLOW: &str = "\x1b[33m";
 pub const CYAN: &str = "\x1b[36m";
 
-/// 人类可读的容量。
-pub fn fmt_bytes(n: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let v = n as f64;
-    if v >= GB {
-        format!("{:.2} GB", v / GB)
-    } else if v >= MB {
-        format!("{:.1} MB", v / MB)
-    } else if v >= KB {
-        format!("{:.0} KB", v / KB)
-    } else {
-        format!("{:.0} B", v)
+pub use crate::report::{fmt_bytes, fmt_delta};
+
+/// 按字符数截断（中文按 1 个字符计，终端宽度会略有偏差）。
+pub fn truncate(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count <= width {
+        return s.to_string();
     }
+    let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// 按显示宽度补空格（粗算：CJK 记 2 宽）。
+pub fn pad(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        return s.to_string();
+    }
+    let mut out = s.to_string();
+    out.push_str(&" ".repeat(width - w));
+    out
+}
+
+/// 粗略显示宽度：CJK / 全角字符按 2 计。
+pub fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| {
+            let cp = c as u32;
+            let wide = matches!(cp,
+                0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 |
+                0xF900..=0xFAFF | 0xFE30..=0xFE6F | 0xFF00..=0xFF60 |
+                0xFFE0..=0xFFE6 | 0x20000..=0x3FFFD);
+            if wide {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
 }
 
 /// 进度条。
@@ -48,73 +73,56 @@ pub fn bar(pct: f64, width: usize) -> String {
     )
 }
 
-/// 按字符数截断并补齐（进程名基本为 ASCII）。
-fn fit(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count > width {
-        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    } else {
-        let mut out = s.to_string();
-        out.push_str(&" ".repeat(width - count));
-        out
-    }
+/// 一列的定义：标题、宽度、是否右对齐。
+pub struct Column<'a> {
+    pub title: &'a str,
+    pub width: usize,
+    pub right: bool,
 }
 
-/// 打印进程内存栈表格。
-pub fn print_table(list: &[ProcInfo], show_index: bool) {
-    let header = if show_index {
-        format!(
-            "{}{:>3}  {:>7}  {:<28} {:>11} {:>11} {:>7}  状态{}",
-            BOLD, "编号", "PID", "进程名", "工作集", "私有内存", "线程", RESET
-        )
-    } else {
-        format!(
-            "{}{:>7}  {:<28} {:>11} {:>11} {:>7}  状态{}",
-            BOLD, "PID", "进程名", "工作集", "私有内存", "线程", RESET
-        )
-    };
-    let rule_len = if show_index { 92 } else { 88 };
-    println!("{}", header);
-    println!("{}", format!("{}{}{}", DIM, "─".repeat(rule_len), RESET));
+/// 渲染表格（含表头与分隔线）。
+pub fn render_table(columns: &[Column<'_>], rows: &[Vec<String>]) -> String {
+    let mut out = String::new();
 
-    for (i, p) in list.iter().enumerate() {
-        let status = if !p.readable {
-            format!("{}无权读取{}", DIM, RESET)
-        } else if crate::ops::is_critical(p.pid, &p.name) {
-            format!("{}系统{}", DIM, RESET)
+    let mut header = String::new();
+    for c in columns {
+        let t = truncate(c.title, c.width);
+        header.push_str(&if c.right {
+            format!("{:>width$}", t, width = c.width)
         } else {
-            format!("{}可操作{}", GREEN, RESET)
-        };
-
-        let name_cell = if p.readable {
-            format!("{:<28}", fit(&p.name, 28))
-        } else {
-            format!("{}{:<28}{}", DIM, fit(&p.name, 28), RESET)
-        };
-
-        if show_index {
-            println!(
-                "{:>3}  {:>7}  {} {:>11} {:>11} {:>7}  {}",
-                i + 1,
-                p.pid,
-                name_cell,
-                fmt_bytes(p.working_set),
-                fmt_bytes(p.private_bytes),
-                p.threads,
-                status
-            );
-        } else {
-            println!(
-                "{:>7}  {} {:>11} {:>11} {:>7}  {}",
-                p.pid,
-                name_cell,
-                fmt_bytes(p.working_set),
-                fmt_bytes(p.private_bytes),
-                p.threads,
-                status
-            );
-        }
+            pad(&t, c.width)
+        });
+        header.push_str("  ");
     }
+    out.push_str(&format!("{}{}{}\n", BOLD, header.trim_end(), RESET));
+
+    let total: usize = columns.iter().map(|c| c.width + 2).sum();
+    out.push_str(&format!(
+        "{}{}{}\n",
+        DIM,
+        "─".repeat(total.saturating_sub(2)),
+        RESET
+    ));
+
+    for row in rows {
+        let mut line = String::new();
+        for (i, c) in columns.iter().enumerate() {
+            let cell = row.get(i).map(String::as_str).unwrap_or("");
+            let t = truncate(cell, c.width);
+            line.push_str(&if c.right {
+                format!("{:>width$}", t, width = c.width)
+            } else {
+                pad(&t, c.width)
+            });
+            line.push_str("  ");
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// 启用 ANSI 转义（Windows 10+ 控制台）。
+pub fn enable_ansi() {
+    crate::win::enable_ansi();
 }

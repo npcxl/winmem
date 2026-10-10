@@ -1,5 +1,10 @@
 //! Windows 原生 API 绑定层（纯 FFI，无任何第三方 crate）。
-#![allow(non_snake_case, non_camel_case_types, dead_code)]
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    dead_code,
+    clippy::upper_case_acronyms
+)]
 
 use std::ffi::c_void;
 
@@ -174,6 +179,30 @@ pub struct TOKEN_ELEVATION {
     pub TokenIsElevated: u32,
 }
 
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct FILETIME {
+    pub dwLowDateTime: u32,
+    pub dwHighDateTime: u32,
+}
+
+impl FILETIME {
+    #[inline]
+    pub fn to_u64(&self) -> u64 {
+        ((self.dwHighDateTime as u64) << 32) | self.dwLowDateTime as u64
+    }
+}
+
+/// 进程仍在运行时的退出码。
+pub const STILL_ACTIVE: u32 = 259;
+
+/// `CreateMemoryResourceNotification` 的通知类型。
+pub const LOW_MEMORY_RESOURCE_NOTIFICATION: u32 = 0;
+pub const HIGH_MEMORY_RESOURCE_NOTIFICATION: u32 = 1;
+
+/// `QueryFullProcessImageNameW` 的 dwFlags。
+pub const PROCESS_NAME_WIN32: u32 = 0;
+
 // ---------------------------------------------------------------------------
 // 外部函数
 // ---------------------------------------------------------------------------
@@ -195,6 +224,34 @@ unsafe extern "system" {
     fn GetStdHandle(nStdHandle: u32) -> HANDLE;
     fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut u32) -> BOOL;
     fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: u32) -> BOOL;
+    fn FreeLibrary(hLibModule: *mut c_void) -> BOOL;
+    /// 查询已加载模块（不增加引用计数，无需释放）。
+    fn GetModuleHandleW(lpModuleName: *const u16) -> *mut c_void;
+
+    // 进程身份判定
+    fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut u32) -> BOOL;
+    fn GetProcessTimes(
+        hProcess: HANDLE,
+        lpCreationTime: *mut FILETIME,
+        lpExitTime: *mut FILETIME,
+        lpKernelTime: *mut FILETIME,
+        lpUserTime: *mut FILETIME,
+    ) -> BOOL;
+    fn QueryFullProcessImageNameW(
+        hProcess: HANDLE,
+        dwFlags: u32,
+        lpExeName: *mut u16,
+        lpdwSize: *mut u32,
+    ) -> BOOL;
+    fn ProcessIdToSessionId(dwProcessId: u32, pSessionId: *mut u32) -> BOOL;
+    fn GetProcessIoCounters(hProcess: HANDLE, lpIoCounters: *mut IO_COUNTERS) -> BOOL;
+
+    // 低内存资源通知
+    fn CreateMemoryResourceNotification(MemoryResourceNotificationType: u32) -> HANDLE;
+    fn QueryMemoryResourceNotification(
+        MemoryResourceNotificationHandle: HANDLE,
+        ResourceState: *mut BOOL,
+    ) -> BOOL;
 }
 
 #[link(name = "psapi")]
@@ -210,7 +267,11 @@ unsafe extern "system" {
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
-    fn OpenProcessToken(ProcessHandle: HANDLE, DesiredAccess: u32, TokenHandle: *mut HANDLE) -> BOOL;
+    fn OpenProcessToken(
+        ProcessHandle: HANDLE,
+        DesiredAccess: u32,
+        TokenHandle: *mut HANDLE,
+    ) -> BOOL;
     fn LookupPrivilegeValueW(
         lpSystemName: *const u16,
         lpName: *const u16,
@@ -231,6 +292,73 @@ unsafe extern "system" {
         TokenInformationLength: u32,
         ReturnLength: *mut u32,
     ) -> BOOL;
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct IO_COUNTERS {
+    pub ReadOperationCount: u64,
+    pub WriteOperationCount: u64,
+    pub OtherOperationCount: u64,
+    pub ReadTransferCount: u64,
+    pub WriteTransferCount: u64,
+    pub OtherTransferCount: u64,
+}
+
+impl IO_COUNTERS {
+    /// 读写字节总数，用于计算 I/O 活跃度。
+    pub fn transfer_total(&self) -> u64 {
+        self.ReadTransferCount
+            .saturating_add(self.WriteTransferCount)
+    }
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetForegroundWindow() -> HANDLE;
+    fn GetWindowThreadProcessId(hWnd: HANDLE, lpdwProcessId: *mut u32) -> u32;
+    fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct SYSTEMTIME {
+    pub wYear: u16,
+    pub wMonth: u16,
+    pub wDayOfWeek: u16,
+    pub wDay: u16,
+    pub wHour: u16,
+    pub wMinute: u16,
+    pub wSecond: u16,
+    pub wMilliseconds: u16,
+}
+
+/// 本地时间字符串（`YYYY-MM-DD HH:MM:SS`），不受显示语言影响。
+pub fn local_time_string() -> String {
+    unsafe {
+        let mut st = SYSTEMTIME::default();
+        GetLocalTime(&mut st);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        )
+    }
+}
+
+/// 当前前台窗口所属进程 PID；没有前台窗口时返回 None。
+pub fn foreground_pid() -> Option<u32> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd == NULL_HANDLE {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        if GetWindowThreadProcessId(hwnd, &mut pid) == 0 || pid == 0 {
+            None
+        } else {
+            Some(pid)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,12 +395,7 @@ pub fn enable_ansi() {
 pub fn is_elevated() -> bool {
     unsafe {
         let mut token: HANDLE = NULL_HANDLE;
-        if OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_QUERY,
-            &mut token,
-        ) == 0
-        {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return false;
         }
         let mut elev = TOKEN_ELEVATION::default();
@@ -316,14 +439,8 @@ pub fn enable_privilege(name: &str) -> bool {
             }],
         };
 
-        let ok = AdjustTokenPrivileges(
-            token,
-            0,
-            &tp,
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
+        let ok =
+            AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut());
         let err = GetLastError();
         CloseHandle(token);
         ok != 0 && err != ERROR_NOT_ALL_ASSIGNED
@@ -352,46 +469,28 @@ pub fn performance_info() -> Option<PERFORMANCE_INFORMATION> {
 
 /// 枚举系统中全部 (pid, 线程数, 进程名)。
 pub fn snapshot_processes() -> Vec<(u32, u32, String)> {
-    let mut out = Vec::with_capacity(256);
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return out;
-        }
-        let mut entry = PROCESSENTRY32W::default();
-        if Process32FirstW(snap, &mut entry) != 0 {
-            loop {
-                let name = utf16_to_string(&entry.szExeFile);
-                out.push((entry.th32ProcessID, entry.cntThreads, name));
-                if Process32NextW(snap, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-    }
-    out
+    snapshot_process_entries()
+        .into_iter()
+        .map(|e| (e.pid, e.threads, e.name))
+        .collect()
 }
 
 /// 查询单个进程的内存计数。
-pub fn process_memory(pid: u32) -> Option<PROCESS_MEMORY_COUNTERS_EX> {
+/// 查询已打开句柄的内存计数（更安全的入口：句柄已由调用方校验过身份）。
+pub fn memory_counters(h: HANDLE) -> Result<PROCESS_MEMORY_COUNTERS_EX, WinError> {
     unsafe {
-        let mut h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h == NULL_HANDLE {
-            h = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
-        }
-        if h == NULL_HANDLE {
-            return None;
-        }
         let mut counters = PROCESS_MEMORY_COUNTERS_EX::new();
-        let ok = GetProcessMemoryInfo(h, &mut counters, counters.cb);
-        CloseHandle(h);
-        if ok != 0 {
-            Some(counters)
-        } else {
-            None
+        if GetProcessMemoryInfo(h, &mut counters, counters.cb) == 0 {
+            return Err(WinError::from_code(GetLastError()));
         }
+        Ok(counters)
     }
+}
+
+/// 打开进程并查询内存计数（便捷版）。
+pub fn process_memory(pid: u32) -> Result<PROCESS_MEMORY_COUNTERS_EX, WinError> {
+    let h = open_handle(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    memory_counters(h.raw())
 }
 
 /// 打开进程（可指定访问权限）。
@@ -408,20 +507,13 @@ pub fn close_handle(h: HANDLE) {
 }
 
 /// 强制结束进程。返回 Ok(()) 或错误码。
-pub fn terminate_process(pid: u32) -> Result<(), u32> {
+/// 结束**已校验身份**的句柄所对应的进程。
+pub fn terminate_handle(h: HANDLE) -> Result<(), WinError> {
     unsafe {
-        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if h == NULL_HANDLE {
-            return Err(GetLastError());
+        if TerminateProcess(h, 1) == 0 {
+            return Err(WinError::from_code(GetLastError()));
         }
-        let ok = TerminateProcess(h, 1);
-        let err = GetLastError();
-        CloseHandle(h);
-        if ok != 0 {
-            Ok(())
-        } else {
-            Err(err)
-        }
+        Ok(())
     }
 }
 
@@ -431,29 +523,441 @@ pub fn purge_standby_list() -> Result<(), i32> {
     const SYSTEM_MEMORY_LIST_INFORMATION: i32 = 0x50;
     const MEMORY_PURGE_STANDBY_LIST: u32 = 4;
 
-    unsafe {
-        let ntdll = LoadLibraryW(wide("ntdll.dll").as_ptr());
-        if ntdll.is_null() {
-            return Err(-1);
-        }
-        let addr = GetProcAddress(ntdll, b"NtSetSystemInformation\0".as_ptr());
-        if addr.is_null() {
-            return Err(-2);
-        }
-        let func: unsafe extern "system" fn(i32, *mut c_void, u32) -> i32 =
-            std::mem::transmute(addr);
-        let mut command = MEMORY_PURGE_STANDBY_LIST;
-        let status = func(
+    let Some(ntdll) = OwnedModule::load("ntdll.dll") else {
+        return Err(-1);
+    };
+    let addr = ntdll.proc("NtSetSystemInformation");
+    if addr.is_null() {
+        return Err(-2);
+    }
+    let func: unsafe extern "system" fn(i32, *mut c_void, u32) -> i32 =
+        unsafe { std::mem::transmute(addr) };
+    let mut command = MEMORY_PURGE_STANDBY_LIST;
+    let status = unsafe {
+        func(
             SYSTEM_MEMORY_LIST_INFORMATION,
             &mut command as *mut u32 as *mut c_void,
             std::mem::size_of::<u32>() as u32,
-        );
-        if status >= 0 {
-            Ok(())
-        } else {
-            Err(status)
+        )
+    };
+    if status >= 0 {
+        Ok(())
+    } else {
+        Err(status)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 特权与低内存通知
+// ---------------------------------------------------------------------------
+
+/// 已启用的特权，Drop 时恢复启用前的状态。
+pub struct PrivilegeGuard {
+    token: OwnedHandle,
+    previous: TOKEN_PRIVILEGES,
+}
+
+impl PrivilegeGuard {
+    /// 启用指定特权；返回 None 表示进程没有该特权或启用失败。
+    pub fn enable(name: &str) -> Option<PrivilegeGuard> {
+        unsafe {
+            let token = {
+                let mut t: HANDLE = NULL_HANDLE;
+                if OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                    &mut t,
+                ) == 0
+                {
+                    return None;
+                }
+                OwnedHandle::new(t)?
+            };
+
+            let mut luid = LUID::default();
+            if LookupPrivilegeValueW(std::ptr::null(), wide(name).as_ptr(), &mut luid) == 0 {
+                return None;
+            }
+
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            let mut previous = TOKEN_PRIVILEGES::default();
+            let mut ret_len: u32 = 0;
+            let ok = AdjustTokenPrivileges(
+                token.raw(),
+                0,
+                &tp,
+                std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                &mut previous,
+                &mut ret_len,
+            );
+            // 必须紧跟 AdjustTokenPrivileges 读取错误码，之后不能再调用其他 API
+            let err = GetLastError();
+            if ok == 0 || err == ERROR_NOT_ALL_ASSIGNED {
+                return None;
+            }
+            Some(PrivilegeGuard { token, previous })
         }
     }
+}
+
+impl Drop for PrivilegeGuard {
+    fn drop(&mut self) {
+        if self.previous.PrivilegeCount == 0 {
+            return;
+        }
+        unsafe {
+            AdjustTokenPrivileges(
+                self.token.raw(),
+                0,
+                &self.previous,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+    }
+}
+
+/// 低内存资源通知（`CreateMemoryResourceNotification`）。
+/// 这是系统提供的受支持接口，用于判断是否处于低内存状态，无需轮询猜测。
+pub struct MemoryResourceNotification(OwnedHandle);
+
+impl MemoryResourceNotification {
+    pub fn low_memory() -> Option<MemoryResourceNotification> {
+        unsafe {
+            let h = CreateMemoryResourceNotification(LOW_MEMORY_RESOURCE_NOTIFICATION);
+            OwnedHandle::new(h).map(MemoryResourceNotification)
+        }
+    }
+
+    /// 当前是否处于低内存状态；接口失败时返回 None（而非伪造成 false）。
+    pub fn is_low(&self) -> Option<bool> {
+        unsafe {
+            let mut state: BOOL = 0;
+            if QueryMemoryResourceNotification(self.0.raw(), &mut state) == 0 {
+                None
+            } else {
+                Some(state != 0)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 错误模型
+// ---------------------------------------------------------------------------
+
+pub const ERROR_ACCESS_DENIED: u32 = 5;
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
+pub const ERROR_NOT_FOUND: u32 = 1168;
+
+/// 操作失败原因分类。上层据此区分权限不足、进程已退出、接口不支持等。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WinError {
+    /// 打开进程/句柄被拒绝，多为权限不足或受保护进程。
+    AccessDenied(u32),
+    /// 进程不存在或已退出。
+    ProcessGone(u32),
+    /// 当前系统不支持该接口（例如 Win7 上的 IsProcessCritical）。
+    NotSupported,
+    /// 其他 Win32 / NTSTATUS 错误。
+    Os(u32),
+}
+
+impl WinError {
+    pub fn from_code(code: u32) -> WinError {
+        match code {
+            ERROR_ACCESS_DENIED => WinError::AccessDenied(code),
+            ERROR_INVALID_PARAMETER | ERROR_NOT_FOUND => WinError::ProcessGone(code),
+            _ => WinError::Os(code),
+        }
+    }
+
+    pub fn code(&self) -> u32 {
+        match self {
+            WinError::AccessDenied(c) | WinError::ProcessGone(c) | WinError::Os(c) => *c,
+            WinError::NotSupported => 0,
+        }
+    }
+
+    pub fn describe(&self) -> &'static str {
+        match self {
+            WinError::AccessDenied(_) => "权限不足",
+            WinError::ProcessGone(_) => "进程已退出",
+            WinError::NotSupported => "当前系统不支持该接口",
+            WinError::Os(_) => "系统调用失败",
+        }
+    }
+}
+
+impl std::fmt::Display for WinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WinError::AccessDenied(c) => write!(f, "权限不足（错误码 {}）", c),
+            WinError::ProcessGone(c) => write!(f, "进程已退出（错误码 {}）", c),
+            WinError::NotSupported => write!(f, "当前系统不支持该接口"),
+            WinError::Os(c) => write!(f, "系统错误（错误码 {}）", c),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RAII 资源管理
+// ---------------------------------------------------------------------------
+
+/// 自有句柄，Drop 时自动 `CloseHandle`。
+pub struct OwnedHandle(HANDLE);
+
+impl OwnedHandle {
+    /// 接管句柄；传入 0 / INVALID_HANDLE_VALUE 时返回 None。
+    pub fn new(h: HANDLE) -> Option<OwnedHandle> {
+        if h == NULL_HANDLE || h == INVALID_HANDLE_VALUE {
+            None
+        } else {
+            Some(OwnedHandle(h))
+        }
+    }
+
+    #[inline]
+    pub fn raw(&self) -> HANDLE {
+        self.0
+    }
+
+    /// 交出所有权，返回裸句柄（调用方负责关闭）。
+    #[inline]
+    pub fn into_raw(self) -> HANDLE {
+        let h = self.0;
+        std::mem::forget(self);
+        h
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+/// 动态加载的模块（Drop 时 `FreeLibrary`，避免引用计数泄漏）。
+pub struct OwnedModule(*mut c_void);
+
+impl OwnedModule {
+    pub fn load(name: &str) -> Option<OwnedModule> {
+        let h = unsafe { LoadLibraryW(wide(name).as_ptr()) };
+        if h.is_null() {
+            None
+        } else {
+            Some(OwnedModule(h))
+        }
+    }
+
+    /// 取导出函数地址。返回的指针在 `self` 存活期间有效。
+    pub fn proc(&self, name: &str) -> *mut c_void {
+        let mut buf: Vec<u8> = name.bytes().collect();
+        buf.push(0);
+        unsafe { GetProcAddress(self.0, buf.as_ptr()) }
+    }
+}
+
+impl Drop for OwnedModule {
+    fn drop(&mut self) {
+        unsafe {
+            FreeLibrary(self.0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 进程身份（PID 会被复用，必须结合创建时间）
+// ---------------------------------------------------------------------------
+
+/// 进程身份。PID 会被系统复用，因此必须同时记录创建时间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    /// 进程创建时间（FILETIME，100ns 单位）
+    pub creation_time: u64,
+}
+
+impl ProcessIdentity {
+    /// 打开进程并读取身份（只需 QUERY_LIMITED_INFORMATION）。
+    pub fn query(pid: u32) -> Result<ProcessIdentity, WinError> {
+        let h = open_handle(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let creation_time = creation_time_of(h.raw())?;
+        Ok(ProcessIdentity { pid, creation_time })
+    }
+
+    /// 校验已打开的句柄是否仍指向同一进程（创建时间一致）。
+    pub fn matches(&self, h: HANDLE) -> bool {
+        matches!(creation_time_of(h), Ok(t) if t == self.creation_time)
+    }
+}
+
+/// 打开进程句柄，失败时立即保存错误码并分类。
+pub fn open_handle(pid: u32, access: u32) -> Result<OwnedHandle, WinError> {
+    unsafe {
+        let h = OpenProcess(access, 0, pid);
+        if let Some(h) = OwnedHandle::new(h) {
+            Ok(h)
+        } else {
+            Err(WinError::from_code(GetLastError()))
+        }
+    }
+}
+
+/// 读取进程创建时间。
+pub fn creation_time_of(h: HANDLE) -> Result<u64, WinError> {
+    unsafe {
+        let mut c = FILETIME::default();
+        let mut e = FILETIME::default();
+        let mut k = FILETIME::default();
+        let mut u = FILETIME::default();
+        if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) == 0 {
+            return Err(WinError::from_code(GetLastError()));
+        }
+        Ok(c.to_u64())
+    }
+}
+
+/// 读取进程 CPU 时间（内核 + 用户，100ns 单位），用于计算 CPU 占用差分。
+pub fn cpu_time_of(h: HANDLE) -> Result<u64, WinError> {
+    unsafe {
+        let mut c = FILETIME::default();
+        let mut e = FILETIME::default();
+        let mut k = FILETIME::default();
+        let mut u = FILETIME::default();
+        if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) == 0 {
+            return Err(WinError::from_code(GetLastError()));
+        }
+        Ok(k.to_u64().saturating_add(u.to_u64()))
+    }
+}
+
+/// 读取进程 I/O 计数器，用于判断是否处于活跃 I/O。
+pub fn io_counters(h: HANDLE) -> Result<IO_COUNTERS, WinError> {
+    unsafe {
+        let mut c = IO_COUNTERS::default();
+        if GetProcessIoCounters(h, &mut c) == 0 {
+            return Err(WinError::from_code(GetLastError()));
+        }
+        Ok(c)
+    }
+}
+
+/// 进程是否仍在运行。
+pub fn is_process_alive(h: HANDLE) -> Result<bool, WinError> {
+    unsafe {
+        let mut code: u32 = 0;
+        if GetExitCodeProcess(h, &mut code) == 0 {
+            return Err(WinError::from_code(GetLastError()));
+        }
+        Ok(code == STILL_ACTIVE)
+    }
+}
+
+type IsCriticalFn = unsafe extern "system" fn(HANDLE, *mut BOOL) -> BOOL;
+
+/// 动态解析 `IsProcessCritical`（Win8.1+ 才有；Win7 上返回 None 由调用方降级）。
+fn is_critical_entry() -> Option<IsCriticalFn> {
+    static ENTRY: std::sync::OnceLock<Option<IsCriticalFn>> = std::sync::OnceLock::new();
+    *ENTRY.get_or_init(|| unsafe {
+        let module = GetModuleHandleW(wide("kernel32.dll").as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        let p = GetProcAddress(module, c"IsProcessCritical".as_ptr() as *const u8);
+        if p.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, IsCriticalFn>(p))
+        }
+    })
+}
+
+/// 系统是否把该进程标记为关键进程。
+/// 系统不支持该接口时返回 `Err(NotSupported)`，调用方需降级处理。
+pub fn is_process_critical(h: HANDLE) -> Result<bool, WinError> {
+    let Some(f) = is_critical_entry() else {
+        return Err(WinError::NotSupported);
+    };
+    unsafe {
+        let mut crit: BOOL = 0;
+        if f(h, &mut crit) == 0 {
+            return Err(WinError::from_code(GetLastError()));
+        }
+        Ok(crit != 0)
+    }
+}
+
+/// 进程可执行文件完整路径。
+pub fn process_path(h: HANDLE) -> Result<String, WinError> {
+    unsafe {
+        let mut buf = vec![0u16; 32768];
+        let mut size = buf.len() as u32;
+        if QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size) == 0 {
+            return Err(WinError::from_code(GetLastError()));
+        }
+        Ok(String::from_utf16_lossy(&buf[..size as usize]))
+    }
+}
+
+/// 进程所属会话 ID。
+pub fn process_session(pid: u32) -> Option<u32> {
+    unsafe {
+        let mut sid: u32 = 0;
+        if ProcessIdToSessionId(pid, &mut sid) != 0 {
+            Some(sid)
+        } else {
+            None
+        }
+    }
+}
+
+/// 当前进程所属会话 ID。
+pub fn current_session() -> Option<u32> {
+    process_session(current_pid())
+}
+
+/// 快照中的一条进程记录。
+#[derive(Debug, Clone)]
+pub struct ProcEntry {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub threads: u32,
+    pub name: String,
+}
+
+/// 枚举全部进程（含父进程 PID，可用于构建应用分组）。
+pub fn snapshot_process_entries() -> Vec<ProcEntry> {
+    let mut out = Vec::with_capacity(256);
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if let Some(snap) = OwnedHandle::new(snap) {
+            let mut entry = PROCESSENTRY32W::default();
+            if Process32FirstW(snap.raw(), &mut entry) != 0 {
+                loop {
+                    out.push(ProcEntry {
+                        pid: entry.th32ProcessID,
+                        parent_pid: entry.th32ParentProcessID,
+                        threads: entry.cntThreads,
+                        name: utf16_to_string(&entry.szExeFile),
+                    });
+                    if Process32NextW(snap.raw(), &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn utf16_to_string(buf: &[u16]) -> String {

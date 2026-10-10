@@ -41,6 +41,14 @@ pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 pub const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
 pub const ES_AUTOHSCROLL: u32 = 0x0080;
 pub const BS_PUSHBUTTON: u32 = 0x0000_0000;
+pub const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
+pub const SS_LEFT: u32 = 0x0000_0000;
+pub const BM_GETCHECK: u32 = 0x00F0;
+pub const BM_SETCHECK: u32 = 0x00F1;
+pub const BST_CHECKED: usize = 1;
+pub const BST_UNCHECKED: usize = 0;
+/// 自定义消息：自动优化会话需要刷新界面
+pub const WM_APP_AUTO: u32 = 0x8000 + 1;
 pub const CS_HREDRAW: u32 = 0x0002;
 pub const CS_VREDRAW: u32 = 0x0001;
 pub const SW_SHOW: i32 = 5;
@@ -100,6 +108,15 @@ pub const LVM_INSERTITEMW: u32 = LVM_FIRST + 77;
 pub const LVM_INSERTCOLUMNW: u32 = LVM_FIRST + 97;
 pub const LVM_SETITEMTEXTW: u32 = LVM_FIRST + 116;
 pub const LVM_SETICONSPACING: u32 = LVM_FIRST + 53;
+pub const LVM_GETTOPINDEX: u32 = LVM_FIRST + 27;
+pub const LVM_ENSUREVISIBLE: u32 = LVM_FIRST + 19;
+pub const LVM_SETCOLUMNWIDTH: u32 = LVM_FIRST + 30;
+
+/// Per-Monitor V2 DPI 变化
+pub const WM_DPICHANGED: u32 = 0x02E0;
+
+/// WM_SIZE 的 wParam
+pub const SIZE_MINIMIZED: usize = 1;
 
 // GDI 度量
 pub const LOGPIXELSY: i32 = 90;
@@ -371,6 +388,7 @@ unsafe extern "system" {
     pub fn DispatchMessageW(lpMsg: *const MSG) -> LRESULT;
     pub fn PostQuitMessage(nExitCode: i32);
     pub fn SendMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
+    pub fn PostMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> BOOL;
     pub fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> BOOL;
     pub fn MoveWindow(
         hWnd: HWND,
@@ -581,6 +599,18 @@ pub unsafe fn lv_select_row(lv: HWND, row: i32, selected: bool) {
         row as WPARAM,
         &mut item as *mut LVITEMW as LPARAM,
     );
+}
+
+/// 当前滚动到顶部的行索引（用于刷新后恢复滚动位置）。
+pub unsafe fn lv_top_index(lv: HWND) -> i32 {
+    SendMessageW(lv, LVM_GETTOPINDEX, 0, 0) as i32
+}
+
+/// 把指定行滚动到可见区域。
+pub unsafe fn lv_ensure_visible(lv: HWND, index: i32) {
+    if index > 0 {
+        SendMessageW(lv, LVM_ENSUREVISIBLE, index as WPARAM, 0);
+    }
 }
 
 pub unsafe fn lv_clear_selection(lv: HWND) {

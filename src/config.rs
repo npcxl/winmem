@@ -40,6 +40,8 @@ pub struct PolicyConfig {
     pub busy_cpu_percent: f64,
     /// 是否允许自动处理未在允许名单中的进程（默认 false）
     pub auto_allow_unlisted: bool,
+    /// 后台采样间隔（秒）
+    pub sample_interval_secs: u64,
 }
 
 impl Default for PolicyConfig {
@@ -60,6 +62,7 @@ impl Default for PolicyConfig {
             min_candidate_ws: 128 * 1024 * 1024,
             busy_cpu_percent: 5.0,
             auto_allow_unlisted: false,
+            sample_interval_secs: 5,
         }
     }
 }
@@ -74,6 +77,12 @@ pub struct Config {
     pub allow: Vec<String>,
     /// 用户是否显式开启自动执行
     pub auto_enabled: bool,
+    /// 首次开启自动优化时是否已展示过说明
+    pub auto_intro_shown: bool,
+    /// 开机自动启动（独立选项，默认关闭）
+    pub start_with_windows: bool,
+    /// 关闭窗口时最小化到托盘（默认开启）
+    pub minimize_to_tray: bool,
     /// 配置文件路径（加载失败时仍为空）
     pub path: Option<PathBuf>,
     /// 加载过程中的告警（未知键、值非法等）
@@ -148,10 +157,18 @@ impl Config {
                 }
                 "min_candidate_ws_mb" => set_mb(&mut p.min_candidate_ws, v, k, &mut cfg.warnings),
                 "busy_cpu_percent" => set_f64(&mut p.busy_cpu_percent, v, k, &mut cfg.warnings),
+                "sample_interval_secs" => {
+                    set_u64(&mut p.sample_interval_secs, v, k, &mut cfg.warnings)
+                }
                 "auto_allow_unlisted" => {
                     set_bool(&mut p.auto_allow_unlisted, v, k, &mut cfg.warnings)
                 }
                 "auto_enabled" => set_bool(&mut cfg.auto_enabled, v, k, &mut cfg.warnings),
+                "auto_intro_shown" => set_bool(&mut cfg.auto_intro_shown, v, k, &mut cfg.warnings),
+                "start_with_windows" => {
+                    set_bool(&mut cfg.start_with_windows, v, k, &mut cfg.warnings)
+                }
+                "minimize_to_tray" => set_bool(&mut cfg.minimize_to_tray, v, k, &mut cfg.warnings),
                 "protect" => cfg.protect = split_list(v),
                 "allow" => cfg.allow = split_list(v),
                 other => cfg.warnings.push(format!("未知配置项：{}", other)),
@@ -173,6 +190,113 @@ impl Config {
         cfg
     }
 
+    /// 把当前配置写回文件。
+    ///
+    /// 会保留文件中的注释与其他未知行，只更新已知键；缺失的键追加到末尾。
+    pub fn save(&self) -> std::io::Result<PathBuf> {
+        let path = self
+            .path
+            .clone()
+            .or_else(Self::default_path)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "无法定位 %APPDATA%")
+            })?;
+
+        let mut map: BTreeMap<String, String> = BTreeMap::new();
+        map.insert("protect".into(), self.protect.join(", "));
+        map.insert("allow".into(), self.allow.join(", "));
+        map.insert("auto_enabled".into(), self.auto_enabled.to_string());
+        map.insert("auto_intro_shown".into(), self.auto_intro_shown.to_string());
+        map.insert(
+            "start_with_windows".into(),
+            self.start_with_windows.to_string(),
+        );
+        map.insert("minimize_to_tray".into(), self.minimize_to_tray.to_string());
+        map.insert(
+            "auto_allow_unlisted".into(),
+            self.policy.auto_allow_unlisted.to_string(),
+        );
+        let p = &self.policy;
+        map.insert(
+            "press_enter_free_ratio".into(),
+            p.press_enter_free_ratio.to_string(),
+        );
+        map.insert(
+            "press_exit_free_ratio".into(),
+            p.press_exit_free_ratio.to_string(),
+        );
+        map.insert("press_hold_secs".into(), p.press_hold_secs.to_string());
+        map.insert("commit_warn_ratio".into(), p.commit_warn_ratio.to_string());
+        map.insert(
+            "commit_alert_ratio".into(),
+            p.commit_alert_ratio.to_string(),
+        );
+        map.insert("batch_size".into(), p.batch_size.to_string());
+        map.insert("run_budget".into(), p.run_budget.to_string());
+        map.insert("cooldown_secs".into(), p.cooldown_secs.to_string());
+        map.insert("observe_secs".into(), p.observe_secs.to_string());
+        map.insert(
+            "min_gain_mb".into(),
+            (p.min_gain_bytes / (1024 * 1024)).to_string(),
+        );
+        map.insert(
+            "min_candidate_ws_mb".into(),
+            (p.min_candidate_ws / (1024 * 1024)).to_string(),
+        );
+        map.insert(
+            "recent_foreground_secs".into(),
+            p.recent_foreground_secs.to_string(),
+        );
+        map.insert("busy_cpu_percent".into(), p.busy_cpu_percent.to_string());
+        map.insert(
+            "sample_interval_secs".into(),
+            p.sample_interval_secs.to_string(),
+        );
+
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut out = String::new();
+        let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            match trimmed.split_once('=') {
+                Some((k, _)) => {
+                    let key = k.trim().to_ascii_lowercase();
+                    match map.get(&key) {
+                        Some(v) => {
+                            out.push_str(&format!("{} = {}\n", k.trim(), v));
+                            written.insert(key);
+                        }
+                        None => {
+                            out.push_str(line);
+                            out.push('\n');
+                        }
+                    }
+                }
+                None => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        for (k, v) in &map {
+            if !written.contains(k) {
+                out.push_str(&format!("{} = {}\n", k, v));
+            }
+        }
+
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, out)?;
+        Ok(path)
+    }
+
     /// 生成默认配置文件内容（供 `--init` 或文档使用）。
     pub fn template() -> String {
         let d = PolicyConfig::default();
@@ -191,6 +315,12 @@ allow =
 auto_enabled = false
 # 是否允许处理未列入 allow 的进程（默认 false，风险自负）
 auto_allow_unlisted = false
+# 首次开启自动优化时是否已展示过说明
+auto_intro_shown = false
+# 开机自动启动（独立选项，默认关闭）
+start_with_windows = false
+# 关闭窗口时最小化到托盘而不是退出
+minimize_to_tray = true
 
 # ---- 压力判定 ----
 press_enter_free_ratio = {}
@@ -208,6 +338,7 @@ min_gain_mb = {}
 min_candidate_ws_mb = {}
 recent_foreground_secs = {}
 busy_cpu_percent = {}
+sample_interval_secs = {}
 ",
             d.press_enter_free_ratio,
             d.press_exit_free_ratio,
@@ -221,7 +352,8 @@ busy_cpu_percent = {}
             d.min_gain_bytes / (1024 * 1024),
             d.min_candidate_ws / (1024 * 1024),
             d.recent_foreground_secs,
-            d.busy_cpu_percent
+            d.busy_cpu_percent,
+            d.sample_interval_secs
         )
     }
 }

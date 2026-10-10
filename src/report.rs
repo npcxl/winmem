@@ -380,7 +380,10 @@ mod tests {
             outcomes: vec![TrimOutcome {
                 pid: 1234,
                 name: "app.exe".into(),
+                working_set_before: None,
                 working_set_reduction: None,
+                working_set_after: None,
+                regrowth_ratio: None,
                 error: None,
                 skipped: None,
             }],

@@ -245,6 +245,22 @@ unsafe extern "system" {
     ) -> BOOL;
     fn ProcessIdToSessionId(dwProcessId: u32, pSessionId: *mut u32) -> BOOL;
     fn GetProcessIoCounters(hProcess: HANDLE, lpIoCounters: *mut IO_COUNTERS) -> BOOL;
+    fn SystemParametersInfoW(
+        uiAction: u32,
+        uiParam: u32,
+        pvParam: *mut c_void,
+        fWinIni: u32,
+    ) -> BOOL;
+    fn GetSysColor(nIndex: i32) -> u32;
+    fn RegGetValueW(
+        hkey: isize,
+        lpSubKey: *const u16,
+        lpValue: *const u16,
+        dwFlags: u32,
+        pdwType: *mut u32,
+        pvData: *mut c_void,
+        pcbData: *mut u32,
+    ) -> i32;
 
     // 低内存资源通知
     fn CreateMemoryResourceNotification(MemoryResourceNotificationType: u32) -> HANDLE;
@@ -343,6 +359,82 @@ pub fn local_time_string() -> String {
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
         )
     }
+}
+
+#[repr(C)]
+pub struct HIGHCONTRASTW {
+    pub cbSize: u32,
+    pub dwFlags: u32,
+    pub lpszDefaultScheme: *mut u16,
+}
+
+pub const SPI_GETHIGHCONTRAST: u32 = 0x0042;
+pub const HCF_HIGHCONTRASTON: u32 = 0x0000_0001;
+
+// 系统颜色索引
+pub const COLOR_WINDOW: i32 = 5;
+pub const COLOR_WINDOWTEXT: i32 = 8;
+pub const COLOR_HIGHLIGHT: i32 = 13;
+pub const COLOR_BTNFACE: i32 = 15;
+pub const COLOR_GRAYTEXT: i32 = 17;
+
+const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as isize;
+const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+
+/// 高对比度是否开启（受支持的系统设置接口，不依赖 undocumented API）。
+pub fn high_contrast_enabled() -> bool {
+    unsafe {
+        let mut hc = HIGHCONTRASTW {
+            cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+            dwFlags: 0,
+            lpszDefaultScheme: std::ptr::null_mut(),
+        };
+        if SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            hc.cbSize,
+            &mut hc as *mut HIGHCONTRASTW as *mut c_void,
+            0,
+        ) == 0
+        {
+            return false;
+        }
+        hc.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+}
+
+/// 读取系统颜色（高对比度下用于保证可读性）。
+pub fn sys_color(index: i32) -> u32 {
+    unsafe { GetSysColor(index) }
+}
+
+/// 应用是否使用浅色主题。读取失败返回 None（此时按浅色处理）。
+pub fn apps_use_light_theme() -> Option<bool> {
+    unsafe {
+        let mut data: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let rc = RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize").as_ptr(),
+            wide("AppsUseLightTheme").as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut c_void,
+            &mut size,
+        );
+        if rc == 0 {
+            Some(data != 0)
+        } else {
+            None
+        }
+    }
+}
+
+/// 当前是否应使用深色配色（高对比度开启时不使用自定义配色）。
+pub fn prefer_dark() -> bool {
+    if high_contrast_enabled() {
+        return false;
+    }
+    matches!(apps_use_light_theme(), Some(false))
 }
 
 /// 当前前台窗口所属进程 PID；没有前台窗口时返回 None。

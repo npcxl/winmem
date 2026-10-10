@@ -15,12 +15,15 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 use winmem::config::Config;
+use winmem::engine::{AutoEvent, AutoStatus};
 use winmem::engine::{CancelToken, Engine, RunOptions};
 use winmem::metrics;
 use winmem::policy::{self, Decision, Purpose};
 use winmem::report;
+use winmem::sysmem;
 use winmem::term::{self, Column};
 use winmem::win;
 
@@ -48,6 +51,8 @@ fn main() {
         "optimize" | "opt" => cmd_optimize(&opts),
         "trim" => cmd_trim(&opts, &rest),
         "monitor" | "mon" => cmd_monitor(&opts),
+        "auto" => cmd_auto(&opts),
+        "sysmem" | "sys" => cmd_sysmem(&rest),
         "standby" | "purge" => cmd_standby(),
         "kill" | "close" => cmd_kill(&opts, &rest, false),
         "config" | "cfg" => cmd_config(&opts),
@@ -412,6 +417,16 @@ fn print_help() {
     println!("  winmem kill --pid 1,2 | --name x 手动结束进程（永不进入自动流程）");
     println!("      --force                      允许处理默认保护但非致命的进程");
     println!("      --yes                        跳过确认（脚本用）");
+    println!("  winmem auto [--on|--off|--allow 名称|--clear-allow|--startup on|off|--run]");
+    println!("                                   智能自动优化（默认关闭；默认只处理允许名单）");
+    println!(
+        "  winmem sysmem [status]           系统内存配置只读诊断（压缩/页面合并/分页文件/提交量）"
+    );
+    println!("  winmem sysmem compression|combining [--enable|--disable]");
+    println!("  winmem sysmem pagefile [--enable|--disable]");
+    println!("                                   系统配置变更（需管理员，可能需重启）");
+    println!("  winmem sysmem restore [项目]      恢复本工具上次修改前的配置");
+    println!("  winmem sysmem history            查看系统配置变更记录");
     println!("  winmem config [--init]           查看配置；--init 生成模板");
     println!("  winmem history                   查看最近操作记录");
     println!();
@@ -911,6 +926,440 @@ fn cmd_config(opts: &HashMap<String, String>) {
     println!("  auto_allow_unlisted = {}", cfg.policy.auto_allow_unlisted);
     for w in &cfg.warnings {
         println!("  {}警告：{}{}", term::YELLOW, w, term::RESET);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// auto：智能自动优化开关
+// ---------------------------------------------------------------------------
+
+fn print_auto_intro() {
+    println!();
+    println!("{}关于「智能自动优化」{}", term::BOLD, term::RESET);
+    println!("  · 开启后程序会在后台监测内存，仅在可用物理内存低于 10% 并持续 30 秒时，");
+    println!("    对你的**允许名单**中的闲置后台应用执行工作集裁剪；");
+    println!("  · 允许名单为空时只监测和提示，不做任何操作；");
+    println!("  · 不会结束进程、不会清空待机列表、不会修改任何系统配置；");
+    println!("  · 工作集裁剪只是把不活跃页面换出，不能修复内存泄漏，也不保证「无影响」；");
+    println!("  · 阈值是经验值，可在配置文件中调整，需按实际负载实测。");
+    println!();
+}
+
+fn cmd_auto(opts: &HashMap<String, String>) {
+    let mut cfg = Config::load();
+    let mut dirty = false;
+
+    if flag(opts, "on") || flag(opts, "enable") {
+        if !cfg.auto_intro_shown {
+            print_auto_intro();
+            cfg.auto_intro_shown = true;
+            dirty = true;
+        }
+        if !cfg.auto_enabled {
+            cfg.auto_enabled = true;
+            dirty = true;
+            println!("{}已开启智能自动优化。{}", term::GREEN, term::RESET);
+            if cfg.allow.is_empty() {
+                println!(
+                    "{}注意：允许名单为空，只会监测与提示。用 winmem auto --allow 名称 添加。{}",
+                    term::YELLOW,
+                    term::RESET
+                );
+            }
+        }
+    }
+    if flag(opts, "off") || flag(opts, "disable") {
+        cfg.auto_enabled = false;
+        dirty = true;
+        println!(
+            "{}已关闭智能自动优化。{}（该开关与系统配置相互独立，不会改动系统设置）",
+            term::GREEN,
+            term::RESET
+        );
+    }
+    if let Some(list) = value(opts, "allow") {
+        for name in list.split([',', ';']) {
+            let n = policy::normalize_name(name);
+            if !n.is_empty() && !cfg.allow.contains(&n) {
+                cfg.allow.push(n);
+            }
+        }
+        dirty = true;
+    }
+    if flag(opts, "clear-allow") {
+        cfg.allow.clear();
+        dirty = true;
+    }
+    if let Some(v) = value(opts, "startup") {
+        cfg.start_with_windows =
+            matches!(v.to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes");
+        dirty = true;
+    }
+
+    if dirty {
+        match cfg.save() {
+            Ok(p) => println!("配置已保存：{}", p.display()),
+            Err(e) => eprintln!("{}保存配置失败：{}{}", term::RED, e, term::RESET),
+        }
+    }
+
+    if flag(opts, "run") || flag(opts, "monitor") {
+        println!();
+        println!(
+            "{}前台运行自动会话（Ctrl+C 退出）…{}",
+            term::CYAN,
+            term::RESET
+        );
+        let mut engine = Engine::new(cfg.clone());
+        let cancel = CancelToken::new();
+        let status = Arc::new(Mutex::new(AutoStatus::default()));
+        winmem::engine::run_auto_session(&mut engine, &cancel, &status, &mut |e| match e {
+            AutoEvent::State(s) => println!("[状态] {}", s.label()),
+            AutoEvent::Notice(m) => println!("[提示] {}", m),
+            AutoEvent::Finished(o) => println!("[完成] {}", report::History::summarize(&o)),
+        });
+        return;
+    }
+
+    println!();
+    println!("{}智能自动优化{}", term::BOLD, term::RESET);
+    println!(
+        "  开关：{}",
+        if cfg.auto_enabled {
+            "已开启"
+        } else {
+            "已关闭（默认）"
+        }
+    );
+    println!(
+        "  允许名单：{}",
+        if cfg.allow.is_empty() {
+            "（空，只监测不执行）".to_string()
+        } else {
+            cfg.allow.join(", ")
+        }
+    );
+    println!(
+        "  保护名单：{}",
+        if cfg.protect.is_empty() {
+            "（空）".to_string()
+        } else {
+            cfg.protect.join(", ")
+        }
+    );
+    println!(
+        "  处理未列入允许名单的进程：{}",
+        if cfg.policy.auto_allow_unlisted {
+            "是（风险自负）"
+        } else {
+            "否（默认）"
+        }
+    );
+    println!(
+        "  开机自动启动：{}",
+        if cfg.start_with_windows {
+            "已开启"
+        } else {
+            "已关闭（默认）"
+        }
+    );
+    println!("  采样间隔：{} 秒", cfg.policy.sample_interval_secs);
+    println!(
+        "  触发条件：可用内存 < {:.0}% 持续 {} 秒（回升到 {:.0}% 退出）",
+        cfg.policy.press_enter_free_ratio * 100.0,
+        cfg.policy.press_hold_secs,
+        cfg.policy.press_exit_free_ratio * 100.0
+    );
+    println!(
+        "  每批 {} 个（上限 {} 个/次），单进程冷却 {} 秒",
+        cfg.policy.batch_size, cfg.policy.run_budget, cfg.policy.cooldown_secs
+    );
+    println!();
+    println!("{}用法：{}", term::DIM, term::RESET);
+    println!("  winmem auto --on                    开启");
+    println!("  winmem auto --off                   关闭");
+    println!("  winmem auto --allow a.exe,b.exe     设置允许名单");
+    println!("  winmem auto --clear-allow           清空允许名单（只监测）");
+    println!("  winmem auto --startup on|off        开机自动启动");
+    println!("  winmem auto --run                   前台运行自动会话");
+}
+
+// ---------------------------------------------------------------------------
+// sysmem：系统内存配置检查与变更
+// ---------------------------------------------------------------------------
+
+fn fmt_opt(v: Option<u64>) -> String {
+    v.map(term::fmt_bytes)
+        .unwrap_or_else(|| report::UNKNOWN.into())
+}
+
+fn cmd_sysmem(rest: &[String]) {
+    let sub = rest
+        .first()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match sub.as_str() {
+        "" | "status" => sysmem_report(),
+        "compression" | "compress" => sysmem_change(sysmem::ChangeKind::MemoryCompression, rest),
+        "combining" => sysmem_change(sysmem::ChangeKind::PageCombining, rest),
+        "pagefile" => sysmem_change(sysmem::ChangeKind::AutomaticPagefile, rest),
+        "restore" => sysmem_restore(rest),
+        "history" => sysmem_history(),
+        other => {
+            eprintln!("{}未知子命令：{}{}", term::RED, other, term::RESET);
+            println!("可用：status / compression / combining / pagefile / restore / history");
+        }
+    }
+}
+
+fn sysmem_report() {
+    println!();
+    println!(
+        "{}正在查询系统内存配置（只读，不会修改任何设置）…{}",
+        term::DIM,
+        term::RESET
+    );
+
+    let mem = win::memory_status();
+    let commit = sysmem::commit_info();
+    let comp = sysmem::probe_compression();
+    let pf = sysmem::probe_page_files();
+
+    println!();
+    println!("{}系统内存{}", term::BOLD, term::RESET);
+
+    if let Some(m) = mem {
+        let used = m.ullTotalPhys.saturating_sub(m.ullAvailPhys);
+        println!(
+            "  物理内存   {}/{}（可用 {}）",
+            term::fmt_bytes(used),
+            term::fmt_bytes(m.ullTotalPhys),
+            term::fmt_bytes(m.ullAvailPhys)
+        );
+    } else {
+        println!("  物理内存   {}", report::UNKNOWN);
+    }
+
+    match commit {
+        Some(c) => println!(
+            "  提交量     {}/{}（{:.1}%，剩余 {}）",
+            term::fmt_bytes(c.total),
+            term::fmt_bytes(c.limit),
+            c.ratio().unwrap_or(0.0) * 100.0,
+            fmt_opt(c.headroom())
+        ),
+        None => println!("  提交量     {}", report::UNKNOWN),
+    }
+
+    println!(
+        "  内存压缩   {}",
+        sysmem::describe_bool(&comp.memory_compression)
+    );
+    println!("     说明：部分页面压缩后留在物理内存，可减少磁盘换入，但需要 CPU 处理。");
+    println!(
+        "  页面合并   {}",
+        sysmem::describe_bool(&comp.page_combining)
+    );
+    println!(
+        "     说明：Windows 可合并内容相同的物理页面，收益取决于重复页面与负载，存在处理开销。"
+    );
+    println!(
+        "  分页文件   {}",
+        match &pf.automatic_managed {
+            sysmem::Probe::Value(true) => "系统自动管理".to_string(),
+            sysmem::Probe::Value(false) => "手动配置".to_string(),
+            other => format!(
+                "{}（{}）",
+                other.label(),
+                match other {
+                    sysmem::Probe::NotSupported => "当前系统不支持查询".to_string(),
+                    sysmem::Probe::Unavailable(w) | sysmem::Probe::Failed(w) => w.clone(),
+                    sysmem::Probe::Value(_) => String::new(),
+                }
+            ),
+        }
+    );
+    for e in &pf.entries {
+        println!(
+            "    {}   已分配 {}   当前使用 {}   峰值 {}",
+            e.path,
+            e.allocated_mb
+                .map(|v| format!("{} MB", v))
+                .unwrap_or_else(|| report::UNKNOWN.into()),
+            e.current_usage_mb
+                .map(|v| format!("{} MB", v))
+                .unwrap_or_else(|| report::UNKNOWN.into()),
+            e.peak_usage_mb
+                .map(|v| format!("{} MB", v))
+                .unwrap_or_else(|| report::UNKNOWN.into())
+        );
+        println!("      （注意：分页文件使用量不是实际写入的字节数，也不是磁盘分页吞吐）");
+    }
+    for v in &pf.volumes {
+        if let (Some(free), Some(total)) = (v.free_bytes, v.total_bytes) {
+            println!(
+                "    {} 卷可用 {}/{}",
+                v.device,
+                term::fmt_bytes(free),
+                term::fmt_bytes(total)
+            );
+        }
+    }
+
+    println!();
+    println!("{}诊断{}", term::BOLD, term::RESET);
+    let diags = sysmem::diagnose(&pf, commit);
+    if diags.is_empty() {
+        println!("  （没有需要提示的项）");
+    }
+    for d in diags {
+        let color = match d.severity {
+            sysmem::Severity::Info => term::DIM,
+            sysmem::Severity::Warn => term::YELLOW,
+            sysmem::Severity::Critical => term::RED,
+        };
+        println!(
+            "  {}{}[{}]{} {}",
+            color,
+            term::BOLD,
+            d.severity.label(),
+            term::RESET,
+            d.text
+        );
+    }
+
+    if !sysmem::is_elevated() {
+        println!();
+        println!(
+            "{}提示：当前进程不是管理员。内存压缩 / 页面合并的查询与全部配置变更需要管理员权限；{}",
+            term::DIM,
+            term::RESET
+        );
+        println!(
+            "{}      普通权限下本页仍可完成分页文件与提交量诊断。{}",
+            term::DIM,
+            term::RESET
+        );
+    }
+
+    println!();
+    println!(
+        "{}说明：本页是只读诊断；参数配置与「智能自动优化」开关是两个独立的东西。{}",
+        term::DIM,
+        term::RESET
+    );
+    println!(
+        "{}      winmem sysmem compression --enable   启用内存压缩（需管理员，可能需重启）{}",
+        term::DIM,
+        term::RESET
+    );
+    println!(
+        "{}      winmem sysmem pagefile --enable        启用系统自动管理分页文件{}",
+        term::DIM,
+        term::RESET
+    );
+    println!(
+        "{}      winmem sysmem restore                  恢复本工具上次修改前的配置{}",
+        term::DIM,
+        term::RESET
+    );
+}
+
+fn sysmem_change(kind: sysmem::ChangeKind, rest: &[String]) {
+    let enable = rest.iter().any(|s| s == "--enable" || s == "on");
+    let disable = rest.iter().any(|s| s == "--disable" || s == "off");
+    let before = sysmem::snapshot_of(kind);
+
+    if !enable && !disable {
+        println!();
+        println!("  {}：{}", kind.title(), before);
+        println!("  用法：winmem sysmem {} --enable | --disable", kind.id());
+        return;
+    }
+
+    println!();
+    println!("{}即将变更系统配置{}", term::BOLD, term::RESET);
+    println!("  项目：{}", kind.title());
+    println!("  当前：{}", before);
+    println!("  目标：{}", if enable { "开启" } else { "关闭" });
+    println!("  权限：需要管理员权限（本程序只在实际变更时请求，不会自动提权）");
+    if kind.needs_reboot() {
+        println!("  重启：该改动可能需要重启后才能完全生效，届时需要再次检查确认");
+    }
+    println!(
+        "{}  注意：配置改变 ≠ 运行效果已确认；本工具不会宣称一定能改善性能。{}",
+        term::YELLOW,
+        term::RESET
+    );
+    println!();
+    if !confirm("确认执行该变更吗？") {
+        println!("{}已取消。{}", term::DIM, term::RESET);
+        return;
+    }
+
+    let outcome = sysmem::apply_change(kind, enable);
+    println!();
+    if outcome.ok {
+        println!("{}{}{}", term::GREEN, outcome.message, term::RESET);
+    } else {
+        println!("{}{}{}", term::RED, outcome.message, term::RESET);
+    }
+    println!("  变更后重新查询：{}", outcome.verified);
+    if !sysmem::is_elevated() {
+        println!(
+            "{}  当前进程不是管理员，系统配置变更会失败或需要提权。{}",
+            term::DIM,
+            term::RESET
+        );
+    }
+}
+
+fn sysmem_restore(rest: &[String]) {
+    let kind = match rest.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("compression") | None => sysmem::ChangeKind::MemoryCompression,
+        Some("combining") => sysmem::ChangeKind::PageCombining,
+        Some("pagefile") => sysmem::ChangeKind::AutomaticPagefile,
+        Some(other) => {
+            eprintln!("{}未知配置项：{}{}", term::RED, other, term::RESET);
+            return;
+        }
+    };
+    let outcome = sysmem::restore_last(kind);
+    println!();
+    if outcome.ok {
+        println!("{}{}{}", term::GREEN, outcome.message, term::RESET);
+    } else {
+        println!("{}{}{}", term::YELLOW, outcome.message, term::RESET);
+    }
+    println!("  当前状态：{}", outcome.verified);
+}
+
+fn sysmem_history() {
+    let changes = sysmem::read_changes();
+    if changes.is_empty() {
+        println!("{}暂无系统配置变更记录。{}", term::DIM, term::RESET);
+        return;
+    }
+    println!();
+    for c in changes {
+        println!("{}{}{}", term::DIM, c.at, term::RESET);
+        println!(
+            "  {}：{} → {}（结果 {}，验证：{}{}）",
+            c.kind,
+            c.before,
+            c.target,
+            c.result,
+            c.verified,
+            if c.reboot_required {
+                "，可能需要重启"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(p) = sysmem::history_path() {
+        println!();
+        println!("{}记录文件：{}{}", term::DIM, p.display(), term::RESET);
     }
 }
 

@@ -149,6 +149,63 @@ fn verified_identity_can_kill_and_process_dies() {
 }
 
 #[test]
+fn auto_session_stops_promptly_when_cancelled() {
+    use std::sync::{Arc, Mutex};
+    use winmem::engine::{run_auto_session, AutoStatus, CancelToken};
+
+    let cfg = winmem::config::Config::default();
+    let mut engine = Engine::new(cfg);
+    let cancel = CancelToken::new();
+    let status = Arc::new(Mutex::new(AutoStatus::default()));
+    let c2 = cancel.clone();
+
+    let handle = std::thread::spawn(move || {
+        run_auto_session(&mut engine, &c2, &status, &mut |_| {});
+    });
+
+    // 等会话真正启动
+    std::thread::sleep(Duration::from_millis(400));
+    cancel.cancel();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(handle.is_finished(), "取消后自动会话必须尽快退出");
+    let _ = handle.join();
+}
+
+#[test]
+fn auto_session_with_empty_allow_list_never_trims() {
+    use std::sync::{Arc, Mutex};
+    use winmem::engine::{run_auto_session, AutoStatus, CancelToken};
+
+    // 开关已打开，但允许名单为空 ⇒ 只监测，不执行
+    let cfg = winmem::config::Config {
+        auto_enabled: true,
+        allow: Vec::new(),
+        ..Default::default()
+    };
+    let mut engine = Engine::new(cfg);
+    let cancel = CancelToken::new();
+    let status = Arc::new(Mutex::new(AutoStatus::default()));
+    let c2 = cancel.clone();
+    let s2 = status.clone();
+
+    let handle = std::thread::spawn(move || {
+        run_auto_session(&mut engine, &c2, &s2, &mut |_| {});
+    });
+    std::thread::sleep(Duration::from_secs(3));
+    cancel.cancel();
+    let _ = handle.join();
+
+    let st = status.lock().unwrap();
+    assert_eq!(st.batches, 0, "允许名单为空时不应执行任何批次");
+    assert_eq!(st.trimmed, 0, "允许名单为空时不应处理任何进程");
+    assert!(!st.running, "会话结束后应标记为已停止");
+}
+
+#[test]
 fn system_snapshot_reports_real_values() {
     let mut engine = Engine::new(Default::default());
     let snap = engine.system_snapshot().expect("应能读取系统内存状态");

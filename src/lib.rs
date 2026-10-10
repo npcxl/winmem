@@ -16,8 +16,10 @@ compile_error!("winmem 仅支持 Windows 平台。");
 
 pub mod config;
 pub mod engine;
+pub mod json;
 pub mod metrics;
 pub mod policy;
 pub mod report;
+pub mod sysmem;
 pub mod term;
 pub mod win;

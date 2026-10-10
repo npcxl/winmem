@@ -16,8 +16,9 @@ mod w32;
 
 use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use winmem::config::Config;
-use winmem::engine::{CancelToken, Engine, RunOptions};
+use winmem::engine::{AutoState, AutoStatus, CancelToken, Engine, RunOptions};
 use winmem::metrics;
 use winmem::policy::{self, Decision, Purpose};
 use winmem::report;
@@ -56,6 +57,12 @@ impl Row {
     fn priv_bytes(&self) -> u64 {
         self.private_bytes.unwrap_or(0)
     }
+}
+
+/// 自动优化会话句柄。丢弃它不会中断线程：必须显式 `cancel()`。
+struct AutoHandle {
+    cancel: CancelToken,
+    status: Arc<Mutex<AutoStatus>>,
 }
 
 /// 采集进程并按统一策略标注状态。
@@ -123,17 +130,87 @@ fn collect_rows(cfg: &Config) -> Vec<Row> {
 // 外观
 // ---------------------------------------------------------------------------
 
-// 取自 Windows 11 浅色主题的系统配色
-const C_BG: u32 = w32::rgb(243, 243, 243);
-const C_PANEL: u32 = w32::rgb(255, 255, 255);
-const C_TEXT: u32 = w32::rgb(26, 26, 26);
-const C_DIM: u32 = w32::rgb(117, 117, 117);
-const C_BORDER: u32 = w32::rgb(229, 229, 229);
-const C_TRACK: u32 = w32::rgb(229, 229, 229);
-const C_GREEN: u32 = w32::rgb(16, 137, 62);
-const C_YELLOW: u32 = w32::rgb(202, 138, 4);
-const C_RED: u32 = w32::rgb(196, 43, 28);
-const C_BLUE: u32 = w32::rgb(0, 95, 184);
+/// 界面配色。跟随系统主题（浅色 / 深色）与高对比度设置。
+#[derive(Clone, Copy, PartialEq)]
+struct Palette {
+    bg: u32,
+    panel: u32,
+    text: u32,
+    dim: u32,
+    border: u32,
+    track: u32,
+    green: u32,
+    yellow: u32,
+    red: u32,
+    blue: u32,
+}
+
+impl Palette {
+    /// Windows 11 浅色
+    const LIGHT: Palette = Palette {
+        bg: w32::rgb(243, 243, 243),
+        panel: w32::rgb(255, 255, 255),
+        text: w32::rgb(26, 26, 26),
+        dim: w32::rgb(117, 117, 117),
+        border: w32::rgb(229, 229, 229),
+        track: w32::rgb(229, 229, 229),
+        green: w32::rgb(16, 137, 62),
+        yellow: w32::rgb(202, 138, 4),
+        red: w32::rgb(196, 43, 28),
+        blue: w32::rgb(0, 95, 184),
+    };
+
+    /// Windows 11 深色
+    const DARK: Palette = Palette {
+        bg: w32::rgb(32, 32, 32),
+        panel: w32::rgb(43, 43, 43),
+        text: w32::rgb(240, 240, 240),
+        dim: w32::rgb(160, 160, 160),
+        border: w32::rgb(60, 60, 60),
+        track: w32::rgb(60, 60, 60),
+        green: w32::rgb(76, 194, 116),
+        yellow: w32::rgb(230, 180, 60),
+        red: w32::rgb(240, 110, 95),
+        blue: w32::rgb(90, 160, 240),
+    };
+
+    /// 高对比度：完全采用系统颜色，保证可读性（不使用自定义配色）。
+    fn high_contrast() -> Palette {
+        Palette {
+            bg: wapi::sys_color(wapi::COLOR_BTNFACE),
+            panel: wapi::sys_color(wapi::COLOR_WINDOW),
+            text: wapi::sys_color(wapi::COLOR_WINDOWTEXT),
+            dim: wapi::sys_color(wapi::COLOR_GRAYTEXT),
+            border: wapi::sys_color(wapi::COLOR_BTNFACE),
+            track: wapi::sys_color(wapi::COLOR_BTNFACE),
+            green: wapi::sys_color(wapi::COLOR_WINDOWTEXT),
+            yellow: wapi::sys_color(wapi::COLOR_WINDOWTEXT),
+            red: wapi::sys_color(wapi::COLOR_WINDOWTEXT),
+            blue: wapi::sys_color(wapi::COLOR_HIGHLIGHT),
+        }
+    }
+
+    /// 根据当前系统设置选择配色。
+    fn load() -> Palette {
+        if wapi::high_contrast_enabled() {
+            Palette::high_contrast()
+        } else if wapi::prefer_dark() {
+            Palette::DARK
+        } else {
+            Palette::LIGHT
+        }
+    }
+
+    fn pressure(&self, pct: f64) -> u32 {
+        if pct >= 90.0 {
+            self.red
+        } else if pct >= 70.0 {
+            self.yellow
+        } else {
+            self.green
+        }
+    }
+}
 
 // 布局
 const TOP_H: i32 = 96;
@@ -147,7 +224,11 @@ const ID_BTN_TRIM: usize = 1003;
 const ID_BTN_KILL: usize = 1004;
 const ID_BTN_PREVIEW: usize = 1009;
 
+/// 智能自动优化开关（复选框）
+const ID_CHK_AUTO: usize = 1010;
+
 // 右键菜单项
+const ID_MENU_SYSMEM: usize = 2006;
 const ID_MENU_TRIM: usize = 2001;
 const ID_MENU_KILL: usize = 2002;
 const ID_MENU_PREVIEW: usize = 2003;
@@ -211,8 +292,16 @@ struct AppState {
     rows: Vec<Row>,
     sort: SortBy,
     filter: String,
+    /// 当前配色（跟随系统主题与高对比度）
+    palette: Palette,
     /// 用户配置（保护名单 / 允许名单）
     config: Config,
+    /// 智能自动优化会话；None 表示未运行
+    auto: Option<AutoHandle>,
+    hchk_auto: w32::HWND,
+    /// 最近一次读取到的自动优化状态
+    auto_state: AutoState,
+    auto_msg: String,
 
     mem: Option<wapi::MEMORYSTATUSEX>,
     perf: Option<wapi::PERFORMANCE_INFORMATION>,
@@ -247,6 +336,11 @@ impl AppState {
             sort: SortBy::Mem,
             filter: String::new(),
             config: Config::load(),
+            palette: Palette::load(),
+            auto: None,
+            hchk_auto: 0,
+            auto_state: AutoState::Off,
+            auto_msg: String::new(),
             mem: None,
             perf: None,
             status: String::new(),
@@ -273,10 +367,10 @@ impl AppState {
 
     fn status_color(&self) -> u32 {
         match self.status_kind {
-            1 => C_GREEN,
-            2 => C_YELLOW,
-            3 => C_RED,
-            _ => C_TEXT,
+            1 => self.palette.green,
+            2 => self.palette.yellow,
+            3 => self.palette.red,
+            _ => self.palette.text,
         }
     }
 
@@ -359,6 +453,35 @@ impl AppState {
             self.buttons.push(h);
         }
 
+        // 智能自动优化开关
+        let chk_text = w32::w("智能自动优化");
+        let chk = w32::CreateWindowExW(
+            0,
+            class_btn.as_ptr(),
+            chk_text.as_ptr(),
+            w32::WS_CHILD | w32::WS_VISIBLE | w32::WS_TABSTOP | w32::BS_AUTOCHECKBOX,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            ID_CHK_AUTO as w32::HMENU,
+            hinst,
+            std::ptr::null_mut(),
+        );
+        w32::set_font(chk, self.font_ui);
+        w32::SendMessageW(
+            chk,
+            w32::BM_SETCHECK,
+            if self.config.auto_enabled {
+                w32::BST_CHECKED
+            } else {
+                w32::BST_UNCHECKED
+            },
+            0,
+        );
+        self.hchk_auto = chk;
+
         // 过滤输入框
         let class_edit = w32::w("EDIT");
         let hint = w32::w("");
@@ -403,6 +526,14 @@ impl AppState {
             x += bw + self.px(8);
         }
         w32::MoveWindow(
+            self.hchk_auto,
+            x + self.px(10),
+            by + self.px(5),
+            self.px(140),
+            self.px(22),
+            1,
+        );
+        w32::MoveWindow(
             self.hfilter,
             w - self.px(240),
             by + 1,
@@ -421,6 +552,40 @@ impl AppState {
             lh,
             1,
         );
+    }
+
+    /// 处理 Per-Monitor V2 的 DPI 变化：重建字体、调整列宽（随后由调用方重新布局）。
+    unsafe fn apply_dpi(&mut self, dpi: u32) {
+        let new_scale = dpi as f32 / 96.0;
+        if (new_scale - self.scale).abs() < 0.01 {
+            return;
+        }
+        self.scale = new_scale;
+
+        for f in [self.font_ui, self.font_title, self.font_small] {
+            if f != 0 {
+                w32::DeleteObject(f);
+            }
+        }
+        self.font_ui = w32::make_font(-self.px(14), w32::FW_NORMAL);
+        self.font_title = w32::make_font(-self.px(21), w32::FW_SEMIBOLD);
+        self.font_small = w32::make_font(-self.px(12), w32::FW_NORMAL);
+
+        for h in self.buttons.iter() {
+            w32::set_font(*h, self.font_ui);
+        }
+        w32::set_font(self.hlist, self.font_ui);
+        w32::set_font(self.hfilter, self.font_ui);
+        w32::set_font(self.hchk_auto, self.font_ui);
+
+        for (i, (_, width, _)) in COLUMNS.iter().enumerate() {
+            w32::SendMessageW(
+                self.hlist,
+                w32::LVM_SETCOLUMNWIDTH,
+                i,
+                self.px(*width) as w32::LPARAM,
+            );
+        }
     }
 
     // -- 数据刷新 ---------------------------------------------------------
@@ -472,6 +637,8 @@ impl AppState {
         self.rows = rows;
 
         unsafe {
+            // 记录滚动位置，刷新后恢复，避免列表跳动
+            let top_index = w32::lv_top_index(self.hlist);
             w32::lv_clear(self.hlist);
             for (i, p) in self.rows.iter().enumerate() {
                 let cells = vec![
@@ -493,6 +660,7 @@ impl AppState {
                     w32::lv_select_row(self.hlist, idx as i32, true);
                 }
             }
+            w32::lv_ensure_visible(self.hlist, top_index);
         }
 
         let sum: u64 = self.rows.iter().map(|p| p.ws()).sum();
@@ -618,6 +786,195 @@ impl AppState {
     }
 
     /// 预览候选与跳过原因（不执行）。
+    /// 从共享状态同步自动优化进度；会话结束后释放句柄。
+    fn pump_auto(&mut self) {
+        let finished = match &self.auto {
+            Some(a) => match a.status.lock() {
+                Ok(s) => {
+                    self.auto_state = s.state;
+                    self.auto_msg = s.message.clone();
+                    !s.running
+                }
+                Err(_) => false,
+            },
+            None => false,
+        };
+        if finished {
+            self.auto = None;
+            self.auto_state = AutoState::Off;
+            self.auto_msg = "自动优化已停止".into();
+            unsafe {
+                w32::SendMessageW(self.hchk_auto, w32::BM_SETCHECK, w32::BST_UNCHECKED, 0);
+            }
+        }
+    }
+
+    /// 切换「智能自动优化」开关。
+    fn op_toggle_auto(&mut self) {
+        let checked = unsafe {
+            w32::SendMessageW(self.hchk_auto, w32::BM_GETCHECK, 0, 0) as usize == w32::BST_CHECKED
+        };
+
+        if !checked {
+            // 关闭：立即取消剩余任务（不撤销已经完成的工作集裁剪）
+            if let Some(a) = self.auto.take() {
+                a.cancel.cancel();
+            }
+            self.auto_state = AutoState::Off;
+            self.auto_msg = "已关闭".into();
+            self.config.auto_enabled = false;
+            let _ = self.config.save();
+            self.set_status(
+                "智能自动优化已关闭，剩余任务已取消（已发生的工作集裁剪无法撤销）。",
+                0,
+            );
+            return;
+        }
+
+        // 首次开启：展示说明
+        if !self.config.auto_intro_shown {
+            unsafe {
+                let msg = "智能自动优化说明：\n\n\
+                    · 后台监测内存，仅在可用物理内存低于 10% 并持续 30 秒时，\n\
+                      对允许名单中的闲置后台应用执行工作集裁剪；\n\
+                    · 不会结束进程、不会清空待机列表、不会修改任何系统配置；\n\
+                    · 工作集裁剪只是把不活跃页面换出，不能修复内存泄漏，\n\
+                      也不能保证完全没有影响；\n\
+                    · 允许名单为空时只监测和提示，不做任何操作。\n\n\
+                    确定开启吗？";
+                let t = w32::w(msg);
+                let cap = w32::w("开启智能自动优化");
+                if w32::MessageBoxW(
+                    self.hwnd,
+                    t.as_ptr(),
+                    cap.as_ptr(),
+                    w32::MB_YESNO | w32::MB_ICONINFORMATION,
+                ) != w32::IDYES
+                {
+                    w32::SendMessageW(self.hchk_auto, w32::BM_SETCHECK, w32::BST_UNCHECKED, 0);
+                    return;
+                }
+            }
+            self.config.auto_intro_shown = true;
+        }
+
+        self.config.auto_enabled = true;
+        let _ = self.config.save();
+
+        if self.config.allow.is_empty() {
+            unsafe {
+                let msg = "允许名单为空：程序只会监测和提示内存压力，不会执行任何操作。\n\n\
+                    是否现在打开配置文件添加允许的进程？";
+                let t = w32::w(msg);
+                let cap = w32::w("允许名单为空");
+                if w32::MessageBoxW(
+                    self.hwnd,
+                    t.as_ptr(),
+                    cap.as_ptr(),
+                    w32::MB_YESNO | w32::MB_ICONINFORMATION,
+                ) == w32::IDYES
+                {
+                    self.op_open_config();
+                }
+            }
+        }
+
+        // 启动后台会话
+        let cancel = CancelToken::new();
+        let status = Arc::new(Mutex::new(AutoStatus::default()));
+        let mut engine = Engine::new(self.config.clone());
+        let c2 = cancel.clone();
+        let s2 = status.clone();
+        let hwnd = self.hwnd;
+        std::thread::spawn(move || {
+            winmem::engine::run_auto_session(&mut engine, &c2, &s2, &mut |_e| unsafe {
+                w32::PostMessageW(hwnd, w32::WM_APP_AUTO, 0, 0);
+            });
+        });
+        self.auto = Some(AutoHandle { cancel, status });
+        self.auto_state = AutoState::Monitoring;
+        self.auto_msg = "正在监测内存压力".into();
+        self.set_status("智能自动优化已开启（后台监测中，不阻塞界面）。", 1);
+    }
+
+    /// 系统内存只读诊断（内存压缩 / 页面合并 / 分页文件 / 提交量）。
+    fn op_sysmem(&mut self) {
+        let mem = wapi::memory_status();
+        let commit = winmem::sysmem::commit_info();
+        let comp = winmem::sysmem::probe_compression();
+        let pf = winmem::sysmem::probe_page_files();
+
+        let mut s = String::new();
+        s.push_str("【只读诊断，不会修改任何系统设置】\n\n");
+        if let Some(m) = mem {
+            let used = m.ullTotalPhys.saturating_sub(m.ullAvailPhys);
+            s.push_str(&format!(
+                "物理内存：{} / {}（可用 {}）\n",
+                term::fmt_bytes(used),
+                term::fmt_bytes(m.ullTotalPhys),
+                term::fmt_bytes(m.ullAvailPhys)
+            ));
+        }
+        match commit {
+            Some(c) => s.push_str(&format!(
+                "提交量：{} / {}（{:.1}%，剩余 {}）\n",
+                term::fmt_bytes(c.total),
+                term::fmt_bytes(c.limit),
+                c.ratio().unwrap_or(0.0) * 100.0,
+                c.headroom()
+                    .map(term::fmt_bytes)
+                    .unwrap_or_else(|| "未知".into())
+            )),
+            None => s.push_str("提交量：未知\n"),
+        }
+        s.push_str(&format!(
+            "内存压缩：{}\n（部分页面压缩后留在物理内存，可减少磁盘换入，但需要 CPU 处理）\n",
+            winmem::sysmem::describe_bool(&comp.memory_compression)
+        ));
+        s.push_str(&format!(
+            "页面合并：{}\n（合并内容相同的物理页面，收益取决于负载，存在处理开销）\n",
+            winmem::sysmem::describe_bool(&comp.page_combining)
+        ));
+        s.push_str(&format!(
+            "分页文件：{}\n",
+            match &pf.automatic_managed {
+                winmem::sysmem::Probe::Value(true) => "系统自动管理".to_string(),
+                winmem::sysmem::Probe::Value(false) => "手动配置".to_string(),
+                other => other.label().to_string(),
+            }
+        ));
+        for e in &pf.entries {
+            s.push_str(&format!(
+                "  {}   已分配 {} MB   使用 {} MB   峰值 {} MB\n",
+                e.path,
+                e.allocated_mb
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                e.current_usage_mb
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                e.peak_usage_mb
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".into())
+            ));
+        }
+        s.push_str("\n诊断：\n");
+        for d in winmem::sysmem::diagnose(&pf, commit) {
+            s.push_str(&format!("  [{}] {}\n", d.severity.label(), d.text));
+        }
+        if !winmem::sysmem::is_elevated() {
+            s.push_str("\n提示：内存压缩/页面合并的查询与全部配置变更需要管理员权限；\n分页文件与提交量诊断在普通权限下可用。\n");
+        }
+        s.push_str("\n配置变更请在命令行执行：winmem sysmem compression --enable");
+
+        unsafe {
+            let t = w32::w(&s);
+            let cap = w32::w("系统内存诊断");
+            w32::MessageBoxW(self.hwnd, t.as_ptr(), cap.as_ptr(), w32::MB_OK);
+        }
+        self.set_status("系统内存诊断完成（只读，未修改任何设置）。", 0);
+    }
+
     /// 高级操作：清空系统待机列表（不进入默认优化流程）。
     fn op_standby(&mut self) {
         unsafe {
@@ -689,11 +1046,12 @@ impl AppState {
         if menu == 0 {
             return;
         }
-        let items: [(usize, &str); 7] = [
+        let items: [(usize, &str); 8] = [
             (ID_MENU_TRIM, "释放选中进程的内存"),
             (ID_MENU_KILL, "结束选中进程…"),
             (ID_MENU_PREVIEW, "预览优化候选与跳过原因…"),
             (0, ""),
+            (ID_MENU_SYSMEM, "系统内存诊断（压缩 / 分页文件 / 提交量）…"),
             (ID_MENU_CONFIG, "打开配置文件（保护名单 / 允许名单）…"),
             (ID_MENU_STANDBY, "清空系统待机列表（高级诊断）…"),
             (0, ""),
@@ -723,6 +1081,7 @@ impl AppState {
             ID_MENU_TRIM => self.op_trim_selected(),
             ID_MENU_KILL => self.op_kill_selected(),
             ID_MENU_PREVIEW => self.op_preview(),
+            ID_MENU_SYSMEM => self.op_sysmem(),
             ID_MENU_CONFIG => self.op_open_config(),
             ID_MENU_STANDBY => self.op_standby(),
             _ => {}
@@ -930,7 +1289,7 @@ impl AppState {
         let pad = self.px(20);
 
         // 整体背景
-        w32::fill_rect(hdc, &rc, C_BG);
+        w32::fill_rect(hdc, &rc, self.palette.bg);
 
         // ---------- 顶部：内存总览 ----------
         let top = w32::RECT {
@@ -939,14 +1298,14 @@ impl AppState {
             right: rc.right,
             bottom: top_h,
         };
-        w32::fill_rect(hdc, &top, C_PANEL);
+        w32::fill_rect(hdc, &top, self.palette.panel);
         let top_line = w32::RECT {
             left: 0,
             top: top_h - 1,
             right: rc.right,
             bottom: top_h,
         };
-        w32::fill_rect(hdc, &top_line, C_BORDER);
+        w32::fill_rect(hdc, &top_line, self.palette.border);
 
         let title = w32::RECT {
             left: pad,
@@ -959,7 +1318,7 @@ impl AppState {
             "winmem  ·  内存优化",
             title,
             w32::DT_LEFT | w32::DT_VCENTER | w32::DT_SINGLELINE,
-            C_TEXT,
+            self.palette.text,
             self.font_title,
         );
 
@@ -972,7 +1331,7 @@ impl AppState {
             } else {
                 0.0
             };
-            let color = pressure_color(pct);
+            let color = self.palette.pressure(pct);
 
             let ur = w32::RECT {
                 left: rc.right - self.px(320),
@@ -998,7 +1357,7 @@ impl AppState {
                 bottom: self.px(52) + bar_h,
             };
             let radius = bar_h / 2;
-            w32::fill_round_rect(hdc, &bar, radius, C_TRACK);
+            w32::fill_round_rect(hdc, &bar, radius, self.palette.track);
             let full = bar.width().max(1);
             let fill_w = (((full as f64) * (pct / 100.0)).round() as i32)
                 .max(bar_h)
@@ -1040,7 +1399,7 @@ impl AppState {
                 &stats,
                 sr,
                 w32::DT_LEFT | w32::DT_VCENTER | w32::DT_SINGLELINE | w32::DT_END_ELLIPSIS,
-                C_DIM,
+                self.palette.dim,
                 self.font_small,
             );
         }
@@ -1057,7 +1416,7 @@ impl AppState {
             "筛选",
             label,
             w32::DT_RIGHT | w32::DT_VCENTER | w32::DT_SINGLELINE,
-            C_DIM,
+            self.palette.dim,
             self.font_ui,
         );
 
@@ -1068,14 +1427,14 @@ impl AppState {
             right: rc.right,
             bottom: rc.bottom,
         };
-        w32::fill_rect(hdc, &sbar, C_PANEL);
+        w32::fill_rect(hdc, &sbar, self.palette.panel);
         let sline = w32::RECT {
             left: 0,
             top: rc.bottom - status_h,
             right: rc.right,
             bottom: rc.bottom - status_h + 1,
         };
-        w32::fill_rect(hdc, &sline, C_BORDER);
+        w32::fill_rect(hdc, &sline, self.palette.border);
 
         let text = if self.status.is_empty() {
             "就绪".to_string()
@@ -1085,7 +1444,7 @@ impl AppState {
         let tr = w32::RECT {
             left: pad,
             top: rc.bottom - status_h + self.px(8),
-            right: rc.right - self.px(200),
+            right: rc.right - self.px(290),
             bottom: rc.bottom - status_h + self.px(32),
         };
         w32::draw_text(
@@ -1097,23 +1456,41 @@ impl AppState {
             self.font_ui,
         );
 
-        if let Some((done, total)) = self.progress {
-            if total > 0 {
-                let pr = w32::RECT {
-                    left: rc.right - self.px(200),
-                    top: rc.bottom - status_h + self.px(8),
-                    right: rc.right - pad,
-                    bottom: rc.bottom - status_h + self.px(32),
-                };
-                w32::draw_text(
-                    hdc,
-                    &format!("{}/{}", done, total),
-                    pr,
-                    w32::DT_RIGHT | w32::DT_VCENTER | w32::DT_SINGLELINE,
-                    C_BLUE,
-                    self.font_ui,
-                );
-            }
+        // 第一行右侧：自动优化状态（运行时优先），否则显示任务进度
+        let right = if self.auto.is_some() {
+            Some((
+                format!("自动优化：{}", self.auto_state.label()),
+                match self.auto_state {
+                    AutoState::Optimizing => self.palette.green,
+                    AutoState::Confirming | AutoState::Cooling => self.palette.yellow,
+                    AutoState::Observing | AutoState::Monitoring => self.palette.blue,
+                    AutoState::Off => self.palette.dim,
+                },
+            ))
+        } else {
+            self.progress.and_then(|(done, total)| {
+                if total > 0 {
+                    Some((format!("{}/{}", done, total), self.palette.blue))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((text, color)) = right {
+            let pr = w32::RECT {
+                left: rc.right - self.px(280),
+                top: rc.bottom - status_h + self.px(8),
+                right: rc.right - pad,
+                bottom: rc.bottom - status_h + self.px(32),
+            };
+            w32::draw_text(
+                hdc,
+                &text,
+                pr,
+                w32::DT_RIGHT | w32::DT_VCENTER | w32::DT_SINGLELINE,
+                color,
+                self.font_ui,
+            );
         }
 
         // 第二行左侧：列表统计
@@ -1123,12 +1500,17 @@ impl AppState {
             right: (rc.right - self.px(280)).max(self.px(200)),
             bottom: rc.bottom - status_h + self.px(52),
         };
+        let stats_line = if self.auto.is_some() && !self.auto_msg.is_empty() {
+            format!("{}　｜　自动优化：{}", self.stats, self.auto_msg)
+        } else {
+            self.stats.clone()
+        };
         w32::draw_text(
             hdc,
-            &self.stats,
+            &stats_line,
             sr2,
             w32::DT_LEFT | w32::DT_VCENTER | w32::DT_SINGLELINE | w32::DT_END_ELLIPSIS,
-            C_DIM,
+            self.palette.dim,
             self.font_small,
         );
 
@@ -1149,21 +1531,11 @@ impl AppState {
             perm,
             pr2,
             w32::DT_RIGHT | w32::DT_VCENTER | w32::DT_SINGLELINE,
-            C_DIM,
+            self.palette.dim,
             self.font_small,
         );
 
         w32::EndPaint(self.hwnd, &ps);
-    }
-}
-
-fn pressure_color(pct: f64) -> u32 {
-    if pct >= 90.0 {
-        C_RED
-    } else if pct >= 70.0 {
-        C_YELLOW
-    } else {
-        C_GREEN
     }
 }
 
@@ -1209,6 +1581,13 @@ unsafe extern "system" fn wndproc(
 
     match msg {
         w32::WM_SIZE => {
+            // 最小化时降低 UI 刷新频率，减少后台开销
+            let interval = if wp == w32::SIZE_MINIMIZED {
+                2000
+            } else {
+                TIMER_MS
+            };
+            w32::SetTimer(hwnd, TIMER_ID, interval, std::ptr::null());
             s.layout();
             w32::InvalidateRect(hwnd, std::ptr::null(), 0);
             0
@@ -1222,6 +1601,27 @@ unsafe extern "system" fn wndproc(
             let mmi = &mut *(lp as *mut w32::MINMAXINFO);
             mmi.ptMinTrackSize.x = s.px(940);
             mmi.ptMinTrackSize.y = s.px(560);
+            0
+        }
+        w32::WM_DPICHANGED => {
+            let dpi = ((wp >> 16) & 0xFFFF) as u32;
+            s.apply_dpi(dpi);
+            let suggested = &*(lp as *const w32::RECT);
+            w32::MoveWindow(
+                hwnd,
+                suggested.left,
+                suggested.top,
+                suggested.width(),
+                suggested.height(),
+                1,
+            );
+            s.layout();
+            w32::InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
+        w32::WM_APP_AUTO => {
+            s.pump_auto();
+            w32::InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
         w32::WM_CONTEXTMENU => {
@@ -1240,6 +1640,7 @@ unsafe extern "system" fn wndproc(
         w32::WM_TIMER => {
             if wp == TIMER_ID {
                 s.pump_tasks();
+                s.pump_auto();
                 s.ticks = s.ticks.wrapping_add(1);
                 if s.ticks % 5 == 0 {
                     s.refresh_memory();
@@ -1260,7 +1661,7 @@ unsafe extern "system" fn wndproc(
         w32::WM_COMMAND => {
             let id = wp & 0xFFFF;
             let code = ((wp >> 16) & 0xFFFF) as u32;
-            if s.busy && id != ID_BTN_REFRESH && id != ID_BTN_PREVIEW {
+            if s.busy && id != ID_BTN_REFRESH && id != ID_BTN_PREVIEW && id != ID_CHK_AUTO {
                 return 0;
             }
             match (id, code) {
@@ -1275,6 +1676,10 @@ unsafe extern "system" fn wndproc(
                 }
                 (ID_BTN_PREVIEW, w32::BN_CLICKED) => {
                     s.op_preview();
+                }
+                (ID_CHK_AUTO, w32::BN_CLICKED) => {
+                    s.op_toggle_auto();
+                    w32::InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 (ID_BTN_TRIM, w32::BN_CLICKED) => {
                     s.op_trim_selected();
@@ -1336,7 +1741,7 @@ unsafe extern "system" fn wndproc(
                             if let Some(p) = s.rows.get(cd.nmcd.dwItemSpec) {
                                 // 非候选（仅手动 / 禁止操作 / 无权读取）的行淡显
                                 if p.state != "可优化" {
-                                    cd.clrText = C_DIM;
+                                    cd.clrText = s.palette.dim;
                                 }
                             }
                         }

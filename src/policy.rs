@@ -79,6 +79,8 @@ pub enum Reason {
     Foreground,
     RecentForeground,
     Busy,
+    /// CPU / I/O 等活动指标未知（无法区分「闲置」与「正在工作」），自动模式跳过
+    UnknownActivity,
     Cooling,
     TooSmall,
     NotInAllowList,
@@ -96,6 +98,7 @@ impl Reason {
             Reason::Foreground => "当前前台应用",
             Reason::RecentForeground => "最近使用过，避免影响交互",
             Reason::Busy => "正在活跃计算或 I/O",
+            Reason::UnknownActivity => "活动指标未知（无法确认闲置）",
             Reason::Cooling => "处于冷却期",
             Reason::TooSmall => "工作集过小，收益有限",
             Reason::NotInAllowList => "不在自动优化允许名单中",
@@ -230,6 +233,10 @@ pub fn decide(input: &PolicyInput<'_>) -> Verdict {
             soft.push(Reason::Busy);
         }
     }
+    // 活动指标未知时，无法区分「闲置」与「正在工作」；自动模式必须保守跳过。
+    if !input.purpose.is_manual() && f.cpu_percent.is_none() {
+        soft.push(Reason::UnknownActivity);
+    }
     if f.cooling {
         soft.push(Reason::Cooling);
     }
@@ -248,7 +255,11 @@ pub fn decide(input: &PolicyInput<'_>) -> Verdict {
         soft.retain(|r| {
             !matches!(
                 r,
-                Reason::TooSmall | Reason::Busy | Reason::Cooling | Reason::NotInAllowList
+                Reason::TooSmall
+                    | Reason::Busy
+                    | Reason::UnknownActivity
+                    | Reason::Cooling
+                    | Reason::NotInAllowList
             )
         });
     }
@@ -666,6 +677,32 @@ mod tests {
             verdict(&small, &cfg, false, None).decision,
             Decision::Skip(Reason::TooSmall)
         ));
+    }
+
+    #[test]
+    fn unknown_activity_skips_auto_but_not_manual() {
+        let cfg = cfg_with_allow();
+
+        // CPU 指标未知：自动模式必须保守跳过，绝不能当成「闲置」
+        let mut unknown = base_facts();
+        unknown.cpu_percent = None;
+        assert!(
+            matches!(
+                verdict(&unknown, &cfg, false, None).decision,
+                Decision::Skip(Reason::UnknownActivity)
+            ),
+            "活动指标未知时自动模式必须跳过"
+        );
+
+        // 手动裁剪：降级为警告并放行
+        let v = verdict(&unknown, &cfg, true, None);
+        assert_eq!(v.decision, Decision::Candidate);
+        assert!(v.warnings.contains(&Reason::UnknownActivity));
+
+        // 手动结束进程：未知活动不应阻挡
+        let kill = kill_verdict(&unknown, &cfg);
+        assert_eq!(kill.decision, Decision::Candidate);
+        assert!(!kill.warnings.contains(&Reason::UnknownActivity));
     }
 
     #[test]

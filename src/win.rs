@@ -268,6 +268,15 @@ unsafe extern "system" {
         MemoryResourceNotificationHandle: HANDLE,
         ResourceState: *mut BOOL,
     ) -> BOOL;
+
+    // 命名互斥体（跨实例协调，禁止并行优化）
+    fn CreateMutexW(
+        lpMutexAttributes: *const c_void,
+        bInitialOwner: BOOL,
+        lpName: *const u16,
+    ) -> HANDLE;
+    fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
+    fn ReleaseMutex(hMutex: HANDLE) -> BOOL;
 }
 
 #[link(name = "psapi")]
@@ -308,6 +317,28 @@ unsafe extern "system" {
         TokenInformationLength: u32,
         ReturnLength: *mut u32,
     ) -> BOOL;
+    // 开机启动（当前用户 HKCU\...\Run）
+    fn RegSetValueExW(
+        hKey: isize,
+        lpValueName: *const u16,
+        Reserved: u32,
+        dwType: u32,
+        lpData: *const u8,
+        cbData: u32,
+    ) -> i32;
+    fn RegDeleteValueW(hKey: isize, lpValueName: *const u16) -> i32;
+    fn RegCloseKey(hKey: isize) -> i32;
+    fn RegCreateKeyExW(
+        hKey: isize,
+        lpSubKey: *const u16,
+        Reserved: u32,
+        lpClass: *const u16,
+        dwOptions: u32,
+        samDesired: u32,
+        lpSecurityAttributes: *const c_void,
+        phkResult: *mut isize,
+        lpdwDisposition: *mut u32,
+    ) -> i32;
 }
 
 #[repr(C)]
@@ -380,6 +411,15 @@ pub const COLOR_GRAYTEXT: i32 = 17;
 
 const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as isize;
 const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+const KEY_SET_VALUE: u32 = 0x0002;
+const REG_SZ: u32 = 1;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const WAIT_OBJECT_0: u32 = 0;
+
+/// 当前用户开机启动项所在的注册表路径与值名。
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "winmem-gui";
 
 /// 高对比度是否开启（受支持的系统设置接口，不依赖 undocumented API）。
 pub fn high_contrast_enabled() -> bool {
@@ -1055,4 +1095,157 @@ pub fn snapshot_process_entries() -> Vec<ProcEntry> {
 fn utf16_to_string(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
+}
+
+// ---------------------------------------------------------------------------
+// 跨实例协调：命名互斥体
+// ---------------------------------------------------------------------------
+
+/// 优化协调用的命名互斥体名称（本机会话范围，不跨用户）。
+pub const OPTIMIZE_MUTEX: &str = "Local\\winmem-optimize-guard";
+
+/// 命名互斥体。持有期间其它实例无法获取，用于**禁止多个实例并行优化**。
+pub struct NamedMutex {
+    handle: OwnedHandle,
+    owned: bool,
+}
+
+impl NamedMutex {
+    /// 尝试获取命名互斥体；已被其它进程/线程持有时返回 `None`，调用方应跳过本次操作。
+    pub fn try_acquire(name: &str) -> Option<NamedMutex> {
+        unsafe {
+            let h = CreateMutexW(std::ptr::null(), 0, wide(name).as_ptr());
+            let handle = OwnedHandle::new(h)?;
+            if WaitForSingleObject(handle.raw(), 0) == WAIT_OBJECT_0 {
+                Some(NamedMutex {
+                    handle,
+                    owned: true,
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl Drop for NamedMutex {
+    fn drop(&mut self) {
+        if self.owned {
+            unsafe {
+                ReleaseMutex(self.handle.raw());
+            }
+            self.owned = false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 开机启动（当前用户 HKCU\...\Run）
+// ---------------------------------------------------------------------------
+
+/// 期望写入运行项的启动命令。GUI 以「最小化到托盘」方式启动，路径含空格时用引号包裹。
+pub fn expected_autostart_command() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    Some(format!("\"{}\" --minimized", exe.display()))
+}
+
+/// 读取当前用户运行项的值；未设置时返回 `Ok(None)`。
+pub fn autostart_value() -> Result<Option<String>, WinError> {
+    unsafe {
+        let mut buf = vec![0u8; 4096];
+        let mut size = buf.len() as u32;
+        let rc = RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide(RUN_KEY).as_ptr(),
+            wide(RUN_VALUE).as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut c_void,
+            &mut size,
+        );
+        if rc == 0 {
+            if size < 2 {
+                return Ok(Some(String::new()));
+            }
+            let w: &[u16] =
+                std::slice::from_raw_parts(buf.as_ptr() as *const u16, size as usize / 2);
+            let end = w.iter().position(|&c| c == 0).unwrap_or(w.len());
+            Ok(Some(String::from_utf16_lossy(&w[..end])))
+        } else if rc as u32 == ERROR_FILE_NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(WinError::from_code(rc as u32))
+        }
+    }
+}
+
+/// 当前用户的开机启动是否已按**本程序期望的路径与参数**注册。
+///
+/// 指向其它路径时返回 `false`（不声称已开启），避免产生「假开关」。
+pub fn autostart_enabled() -> Result<bool, WinError> {
+    let expected = expected_autostart_command();
+    match autostart_value()? {
+        None => Ok(false),
+        Some(v) => Ok(expected
+            .map(|e| e.eq_ignore_ascii_case(&v))
+            .unwrap_or(false)),
+    }
+}
+
+/// 注册 / 撤销当前用户的开机启动，并在写入后**读回验证实际状态**。
+///
+/// 只写 HKCU，不需要管理员权限，也不需要整个程序以管理员运行。
+pub fn set_autostart(enabled: bool) -> Result<(), WinError> {
+    unsafe {
+        let mut key: isize = 0;
+        let rc = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            wide(RUN_KEY).as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            return Err(WinError::from_code(rc as u32));
+        }
+        let rc = if enabled {
+            match expected_autostart_command() {
+                Some(cmd) => {
+                    let data = wide(&cmd);
+                    RegSetValueExW(
+                        key,
+                        wide(RUN_VALUE).as_ptr(),
+                        0,
+                        REG_SZ,
+                        data.as_ptr() as *const u8,
+                        (data.len() * 2) as u32,
+                    )
+                }
+                None => {
+                    RegCloseKey(key);
+                    return Err(WinError::NotSupported);
+                }
+            }
+        } else {
+            let r = RegDeleteValueW(key, wide(RUN_VALUE).as_ptr());
+            if r as u32 == ERROR_FILE_NOT_FOUND {
+                0
+            } else {
+                r
+            }
+        };
+        RegCloseKey(key);
+        if rc != 0 {
+            return Err(WinError::from_code(rc as u32));
+        }
+    }
+    // 写回后读回验证，不满足期望则报告失败
+    if autostart_enabled()? != enabled {
+        return Err(WinError::Os(0));
+    }
+    Ok(())
 }

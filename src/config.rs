@@ -297,6 +297,41 @@ impl Config {
         Ok(path)
     }
 
+    /// 配置内容指纹。
+    ///
+    /// 后台自动会话用它检测「配置文件是否被外部修改」（等价于版本号）：
+    /// 指纹变化就重新加载，因此 `winmem auto --off`、GUI 保存、手改配置都能**及时生效**；
+    /// 指纹未变则不做任何事，避免无谓的重复加载。
+    pub fn fingerprint(&self) -> u64 {
+        let p = &self.policy;
+        let mut s = String::new();
+        s.push_str(&format!("auto={};unlisted={};", self.auto_enabled, p.auto_allow_unlisted));
+        s.push_str("protect=");
+        s.push_str(&self.protect.join(","));
+        s.push_str(";allow=");
+        s.push_str(&self.allow.join(","));
+        s.push_str(&format!(
+            ";enter={};exit={};hold={};warn={};alert={};batch={};budget={};cd={};obs={};\
+             gain={};fg={};ws={};cpu={};int={};track={:?}",
+            p.press_enter_free_ratio,
+            p.press_exit_free_ratio,
+            p.press_hold_secs,
+            p.commit_warn_ratio,
+            p.commit_alert_ratio,
+            p.batch_size,
+            p.run_budget,
+            p.cooldown_secs,
+            p.observe_secs,
+            p.min_gain_bytes,
+            p.recent_foreground_secs,
+            p.min_candidate_ws,
+            p.busy_cpu_percent,
+            p.sample_interval_secs,
+            p.track_secs
+        ));
+        fnv1a(s.as_bytes())
+    }
+
     /// 生成默认配置文件内容（供 `--init` 或文档使用）。
     pub fn template() -> String {
         let d = PolicyConfig::default();
@@ -356,6 +391,16 @@ sample_interval_secs = {}
             d.sample_interval_secs
         )
     }
+}
+
+/// FNV-1a 64 位哈希（用于配置指纹，无需第三方哈希库）。
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn split_list(v: &str) -> Vec<String> {
@@ -460,6 +505,29 @@ auto_enabled = yes
     fn zero_batch_size_is_rejected() {
         let c = Config::parse("batch_size = 0\n");
         assert_eq!(c.policy.batch_size, 1);
+    }
+
+    #[test]
+    fn fingerprint_tracks_relevant_changes() {
+        let a = Config::default();
+        let b = Config::default();
+        assert_eq!(a.fingerprint(), b.fingerprint(), "相同配置指纹必须一致");
+
+        let mut c = Config::default();
+        c.allow.push("chrome.exe".into());
+        assert_ne!(a.fingerprint(), c.fingerprint(), "允许名单变化必须改变指纹");
+
+        let mut d = Config::default();
+        d.protect.push("x".into());
+        assert_ne!(a.fingerprint(), d.fingerprint(), "保护名单变化必须改变指纹");
+
+        let mut e = Config::default();
+        e.auto_enabled = true;
+        assert_ne!(a.fingerprint(), e.fingerprint(), "开关变化必须改变指纹");
+
+        let mut f = Config::default();
+        f.policy.cooldown_secs += 1;
+        assert_ne!(a.fingerprint(), f.fingerprint(), "策略参数变化必须改变指纹");
     }
 
     #[test]

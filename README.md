@@ -40,6 +40,14 @@ cargo build --release
 要求：Windows 10/11 或 Windows 7+（64 位），Rust 1.82+。
 涉及系统进程时需要**以管理员身份运行**；普通权限下会自动降级（受保护进程被跳过并说明原因）。
 
+不想在本地装 Rust，可以直接用 GitHub 在线打包的产物：
+
+- 每次推送到 `main`：打开仓库 **Actions → 最新一次 `CI` 运行 → Artifacts**，
+  下载 `winmem-x86_64-pc-windows-msvc`（内含 `winmem.exe`、`winmem-gui.exe` 和 README）。
+- 正式版本：推送 `v*` 标签（如 `git tag v0.2.0 && git push origin v0.2.0`），
+  工作流会在 **Releases** 页自动生成同名发布并附上下载包。
+- 工作流定义：`.github/workflows/ci.yml`（先跑 fmt / clippy / test，再在 `windows-latest` 上 `cargo build --release`）。
+
 ---
 
 ## 三、快速开始

@@ -1,95 +1,87 @@
 name: CI
 
+# 持续集成：只做格式 / 静态检查 / 测试 / 发布前构建校验，**不发布**。
+# 发布流程见 .github/workflows/release.yml（打 tag 触发）。
+
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  ZIP_NAME: winmem-x86_64-pc-windows-msvc.zip
+  RUST_BACKTRACE: 1
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: 检查（fmt / clippy / test）
+  check:
+    name: 检查（fmt / clippy / test / release 构建）
     runs-on: windows-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: rustfmt
-        run: cargo fmt --check
+      - name: 格式检查
+        run: cargo fmt --all --check
 
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: 静态检查
+        run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: test
-        run: cargo test --all-targets
+      - name: 测试
+        run: cargo test --all-targets --locked
 
-  package:
-    name: 打包（Windows x64）
-    runs-on: windows-latest
-    needs: test
-    permissions:
-      # 打 tag 时需要创建 Release
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: build (release)
+      # 与发布完全一致的构建配置，避免「CI 过了但发布失败」
+      - name: 发布构建
         run: cargo build --release --locked
 
-      - name: 组装发布包
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/winmem.exe, target/release/winmem-gui.exe dist/
-          Copy-Item README.md dist/
-          Compress-Archive -Path dist/* -DestinationPath $env:ZIP_NAME -Force
-          Get-ChildItem dist | Select-Object Name, Length
-
-      - name: 校验产物
+      - name: 校验可执行文件与内嵌 manifest
         shell: pwsh
         run: |
           foreach ($f in @("winmem.exe", "winmem-gui.exe")) {
-            $p = Join-Path "dist" $f
+            $p = "target/release/$f"
             if (-not (Test-Path $p)) { throw "缺少产物：$f" }
             if ((Get-Item $p).Length -eq 0) { throw "产物为空：$f" }
           }
+          # Common Controls v6 依赖必须真的写进了 manifest
+          $bin = [System.IO.File]::ReadAllText("target/release/winmem-gui.exe")
+          if ($bin -notmatch "Microsoft.Windows.Common-Controls") {
+            throw "winmem-gui.exe 未嵌入 Common Controls v6 manifest"
+          }
 
-      - name: 上传构建产物
+      # 自检只在日志里留一份实测开销；无桌面会话时允许失败，不影响 CI 结果
+      - name: 自检开销（可失败，仅记录）
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        run: .\target\release\winmem-gui.exe --bench 10
+
+      - name: 上传自检报告
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: winmem-x86_64-pc-windows-msvc
-          path: ${{ env.ZIP_NAME }}
-          if-no-files-found: error
-          retention-days: 90
+          name: winmem-bench-report
+          path: winmem-bench.txt
+          if-no-files-found: ignore
+          retention-days: 30
 
-      - name: 发布 Release（仅 tag）
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.ref_name }}" "$env:ZIP_NAME" `
-            --title "${{ github.ref_name }}" `
-            --generate-notes
+      - name: 上传未发布构建（便于直接试用）
+        uses: actions/upload-artifact@v4
+        with:
+          name: winmem-x86_64-pc-windows-msvc-dev
+          path: |
+            target/release/winmem.exe
+            target/release/winmem-gui.exe
+          if-no-files-found: error
+          retention-days: 14

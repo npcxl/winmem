@@ -494,6 +494,322 @@ pub fn foreground_pid() -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// 文件替换（热更新用）
+// ---------------------------------------------------------------------------
+
+pub const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+pub const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+unsafe extern "system" {
+    fn MoveFileExW(lpExistingFileName: *const u16, lpNewFileName: *const u16, dwFlags: u32)
+        -> BOOL;
+    fn DeleteFileW(lpFileName: *const u16) -> BOOL;
+    fn CopyFileW(
+        lpExistingFileName: *const u16,
+        lpNewFileName: *const u16,
+        bFailIfExists: BOOL,
+    ) -> BOOL;
+}
+
+/// 移动 / 重命名文件；目标已存在时按 `REPLACE_EXISTING` 覆盖。
+///
+/// Windows 允许**重命名正在运行的 exe**（不允许删除），这是自更新的关键：
+/// 先把旧 exe 改名，再把新 exe 放到原位置。
+pub fn move_file(from: &std::path::Path, to: &std::path::Path) -> Result<(), WinError> {
+    let f = wide(&from.to_string_lossy());
+    let t = wide(&to.to_string_lossy());
+    unsafe {
+        if MoveFileExW(
+            f.as_ptr(),
+            t.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        ) == 0
+        {
+            return Err(WinError::from_code(last_error()));
+        }
+    }
+    Ok(())
+}
+
+/// 复制文件（不覆盖已存在的目标）。
+pub fn copy_file(from: &std::path::Path, to: &std::path::Path) -> Result<(), WinError> {
+    let f = wide(&from.to_string_lossy());
+    let t = wide(&to.to_string_lossy());
+    unsafe {
+        if CopyFileW(f.as_ptr(), t.as_ptr(), 1) == 0 {
+            return Err(WinError::from_code(last_error()));
+        }
+    }
+    Ok(())
+}
+
+/// 删除文件；文件不存在视为成功。正在运行的 exe 删除会失败（这是预期行为）。
+pub fn delete_file(path: &std::path::Path) -> Result<(), WinError> {
+    let p = wide(&path.to_string_lossy());
+    unsafe {
+        if DeleteFileW(p.as_ptr()) == 0 {
+            let code = last_error();
+            const ERROR_FILE_NOT_FOUND: u32 = 2;
+            const ERROR_PATH_NOT_FOUND: u32 = 3;
+            if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND {
+                return Ok(());
+            }
+            return Err(WinError::from_code(code));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// HTTP（WinHTTP）：仅用于版本检查与更新包下载
+// ---------------------------------------------------------------------------
+
+/// `WinHttpOpen` 的访问类型：使用系统默认代理设置。
+const ACCESS_TYPE_DEFAULT_PROXY: u32 = 0;
+/// 允许跟随重定向（GitHub Release 资源会 302 到对象存储）。
+const OPTION_REDIRECT_POLICY: u32 = 118;
+const REDIRECT_POLICY_ALWAYS: u32 = 2;
+/// ：请求使用 TLS。
+const FLAG_SECURE: u32 = 0x0080_0000;
+/// （= ）：绕过代理缓存。
+///
+/// 注意：该值是 0x100 而不是 0x04000000；传错会直接得到 ERROR_INVALID_PARAMETER。
+const FLAG_REFRESH: u32 = 0x0000_0100;
+/// 查询状态码。
+const QUERY_STATUS_CODE: u32 = 19;
+const QUERY_FLAG_NUMBER: u32 = 0x2000_0000;
+const ADDREQ_FLAG_ADD: u32 = 0x2000_0000;
+const ADDREQ_FLAG_REPLACE: u32 = 0x8000_0000;
+
+type HInternet = isize;
+
+#[link(name = "winhttp")]
+unsafe extern "system" {
+    fn WinHttpOpen(
+        pszAgentW: *const u16,
+        dwAccessType: u32,
+        pszProxyW: *const u16,
+        pszProxyBypassW: *const u16,
+        dwFlags: u32,
+    ) -> HInternet;
+    fn WinHttpConnect(
+        hSession: HInternet,
+        pswzServerName: *const u16,
+        nServerPort: u16,
+        dwReserved: u32,
+    ) -> HInternet;
+    fn WinHttpOpenRequest(
+        hConnect: HInternet,
+        pwszVerb: *const u16,
+        pwszObjectName: *const u16,
+        pwszVersion: *const u16,
+        pwszReferrer: *const u16,
+        ppwszAcceptTypes: *const *const u16,
+        dwFlags: u32,
+    ) -> HInternet;
+    fn WinHttpSetOption(
+        hInternet: HInternet,
+        dwOption: u32,
+        lpBuffer: *mut c_void,
+        dwBufferLength: u32,
+    ) -> BOOL;
+    fn WinHttpSetTimeouts(
+        hInternet: HInternet,
+        nResolveTimeout: i32,
+        nConnectTimeout: i32,
+        nSendTimeout: i32,
+        nReceiveTimeout: i32,
+    ) -> BOOL;
+    fn WinHttpAddRequestHeaders(
+        hRequest: HInternet,
+        lpszHeaders: *const u16,
+        dwHeadersLength: u32,
+        dwModifiers: u32,
+    ) -> BOOL;
+    fn WinHttpSendRequest(
+        hRequest: HInternet,
+        lpszHeaders: *const u16,
+        dwHeadersLength: u32,
+        lpOptional: *const c_void,
+        dwOptionalLength: u32,
+        dwTotalLength: u32,
+        dwContext: usize,
+    ) -> BOOL;
+    fn WinHttpReceiveResponse(hRequest: HInternet, lpReserved: *mut c_void) -> BOOL;
+    fn WinHttpQueryHeaders(
+        hRequest: HInternet,
+        dwInfoLevel: u32,
+        pwszName: *const u16,
+        lpBuffer: *mut c_void,
+        lpdwBufferLength: *mut u32,
+        lpdwIndex: *mut u32,
+    ) -> BOOL;
+    fn WinHttpReadData(
+        hRequest: HInternet,
+        lpBuffer: *mut c_void,
+        dwNumberOfBytesToRead: u32,
+        lpdwNumberOfBytesRead: *mut u32,
+    ) -> BOOL;
+    fn WinHttpCloseHandle(hInternet: HInternet) -> BOOL;
+}
+
+/// `WinHttp*` 句柄的 RAII 包装。
+struct HttpHandle(HInternet);
+
+impl HttpHandle {
+    fn new(h: HInternet) -> Option<HttpHandle> {
+        if h == 0 {
+            None
+        } else {
+            Some(HttpHandle(h))
+        }
+    }
+    fn raw(&self) -> HInternet {
+        self.0
+    }
+}
+
+impl Drop for HttpHandle {
+    fn drop(&mut self) {
+        unsafe {
+            WinHttpCloseHandle(self.0);
+        }
+    }
+}
+
+/// 简单拆分 `https://host[:port]/path?query`。
+fn split_url(url: &str) -> Result<(String, u16, String, bool), String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("URL 缺少协议：{}", url))?;
+    let secure = match scheme.to_ascii_lowercase().as_str() {
+        "https" => true,
+        "http" => false,
+        other => return Err(format!("不支持的协议：{}", other)),
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().map_err(|_| "端口非法".to_string())?),
+        None => (authority, if secure { 443 } else { 80 }),
+    };
+    if host.is_empty() {
+        return Err("URL 缺少主机名".into());
+    }
+    Ok((host.to_string(), port, path.to_string(), secure))
+}
+
+/// HTTP(S) GET，返回 `(状态码, 响应体)`。
+///
+/// - 跟随重定向（GitHub Release 资源会跳转到对象存储）；
+/// - 有超时，失败时给出明确原因；
+/// - 响应体超过 `max_bytes` 时直接报错，避免异常大响应拖垮内存。
+pub fn http_get(url: &str, max_bytes: usize) -> Result<(u32, Vec<u8>), String> {
+    let (host, port, path, secure) = split_url(url)?;
+    unsafe {
+        let session = HttpHandle::new(WinHttpOpen(
+            wide("winmem").as_ptr(),
+            ACCESS_TYPE_DEFAULT_PROXY,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        ))
+        .ok_or_else(|| "WinHttpOpen 失败".to_string())?;
+        WinHttpSetTimeouts(session.raw(), 10_000, 15_000, 15_000, 30_000);
+
+        let connect = HttpHandle::new(WinHttpConnect(session.raw(), wide(&host).as_ptr(), port, 0))
+            .ok_or_else(|| format!("无法连接 {}", host))?;
+
+        let flags = FLAG_REFRESH | if secure { FLAG_SECURE } else { 0 };
+        let verb = wide("GET");
+        let object = wide(&path);
+        let request = HttpHandle::new(WinHttpOpenRequest(
+            connect.raw(),
+            verb.as_ptr(),
+            object.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            flags,
+        ))
+        .ok_or_else(|| {
+            format!("WinHttpOpenRequest 失败（{}，错误码 {}）", url, last_error())
+        })?;
+
+        let mut policy = REDIRECT_POLICY_ALWAYS;
+        WinHttpSetOption(
+            request.raw(),
+            OPTION_REDIRECT_POLICY,
+            &mut policy as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        let headers = wide("Accept: application/json\r\nAccept-Encoding: identity\r\n");
+        WinHttpAddRequestHeaders(
+            request.raw(),
+            headers.as_ptr(),
+            headers.len() as u32 - 1,
+            ADDREQ_FLAG_ADD | ADDREQ_FLAG_REPLACE,
+        );
+
+        if WinHttpSendRequest(
+            request.raw(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+            0,
+        ) == 0
+        {
+            return Err(format!("请求发送失败（错误码 {}）", last_error()));
+        }
+        if WinHttpReceiveResponse(request.raw(), std::ptr::null_mut()) == 0 {
+            return Err(format!("接收响应失败（错误码 {}）", last_error()));
+        }
+
+        let mut status: u32 = 0;
+        let mut len = std::mem::size_of::<u32>() as u32;
+        if WinHttpQueryHeaders(
+            request.raw(),
+            QUERY_STATUS_CODE | QUERY_FLAG_NUMBER,
+            std::ptr::null(),
+            &mut status as *mut u32 as *mut c_void,
+            &mut len,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err("无法读取 HTTP 状态码".into());
+        }
+
+        let mut body: Vec<u8> = Vec::new();
+        loop {
+            let mut buf = [0u8; 16 * 1024];
+            let mut read: u32 = 0;
+            if WinHttpReadData(
+                request.raw(),
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                &mut read,
+            ) == 0
+            {
+                return Err(format!("读取响应失败（错误码 {}）", last_error()));
+            }
+            if read == 0 {
+                break;
+            }
+            if body.len() + read as usize > max_bytes {
+                return Err(format!("响应超过上限 {} 字节", max_bytes));
+            }
+            body.extend_from_slice(&buf[..read as usize]);
+        }
+        Ok((status, body))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
 
@@ -1143,10 +1459,16 @@ impl Drop for NamedMutex {
 // 开机启动（当前用户 HKCU\...\Run）
 // ---------------------------------------------------------------------------
 
-/// 期望写入运行项的启动命令。GUI 以「最小化到托盘」方式启动，路径含空格时用引号包裹。
+/// 期望写入运行项的启动命令。
+///
+/// 始终指向同目录下的 **`winmem-gui.exe`**（命令行 `winmem.exe` 只是可选入口），
+/// 以「最小化到托盘」方式启动；路径含空格时用引号包裹。
 pub fn expected_autostart_command() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
-    Some(format!("\"{}\" --minimized", exe.display()))
+    let dir = exe.parent()?;
+    let gui = dir.join("winmem-gui.exe");
+    let target = if gui.exists() { gui } else { exe };
+    Some(format!("\"{}\" --minimized", target.display()))
 }
 
 /// 读取当前用户运行项的值；未设置时返回 `Ok(None)`。

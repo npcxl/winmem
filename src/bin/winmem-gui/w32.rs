@@ -38,9 +38,21 @@ pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub const WS_TABSTOP: u32 = 0x0001_0000;
 pub const WS_BORDER: u32 = 0x0080_0000;
 pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+pub const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
 pub const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
 pub const ES_AUTOHSCROLL: u32 = 0x0080;
+pub const ES_MULTILINE: u32 = 0x0004;
+pub const ES_AUTOVSCROLL: u32 = 0x0040;
+pub const ES_READONLY: u32 = 0x0800;
+pub const ES_WANTRETURN: u32 = 0x1000;
+pub const WS_VSCROLL: u32 = 0x0020_0000;
+pub const WS_HSCROLL: u32 = 0x0010_0000;
+pub const WS_POPUP: u32 = 0x8000_0000;
+pub const WS_CAPTION: u32 = 0x00C0_0000;
+pub const WS_SYSMENU: u32 = 0x0008_0000;
+pub const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
 pub const BS_PUSHBUTTON: u32 = 0x0000_0000;
+pub const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
 pub const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
 pub const SS_LEFT: u32 = 0x0000_0000;
 pub const BM_GETCHECK: u32 = 0x00F0;
@@ -49,9 +61,32 @@ pub const BST_CHECKED: usize = 1;
 pub const BST_UNCHECKED: usize = 0;
 /// 自定义消息：自动优化会话需要刷新界面
 pub const WM_APP_AUTO: u32 = 0x8000 + 1;
+/// 自定义消息：托盘图标回调
+pub const WM_APP_TRAY: u32 = 0x8000 + 2;
+/// 自定义消息：名单编辑对话框已关闭
+pub const WM_APP_LISTS: u32 = 0x8000 + 3;
+
+// 托盘图标
+pub const NIM_ADD: u32 = 0x0000_0000;
+pub const NIM_MODIFY: u32 = 0x0000_0001;
+pub const NIM_DELETE: u32 = 0x0000_0002;
+pub const NIF_MESSAGE: u32 = 0x0000_0001;
+pub const NIF_ICON: u32 = 0x0000_0002;
+pub const NIF_TIP: u32 = 0x0000_0004;
+pub const WM_LBUTTONDBLCLK: u32 = 0x0203;
+pub const WM_LBUTTONUP: u32 = 0x0202;
+pub const WM_RBUTTONUP: u32 = 0x0205;
+pub const WM_NULL: u32 = 0x0000;
+pub const SW_HIDE: i32 = 0;
+pub const SW_RESTORE: i32 = 9;
+pub const IDI_APPLICATION: usize = 32512;
+pub const TPM_LEFTALIGN: u32 = 0x0000;
+pub const TPM_BOTTOMALIGN: u32 = 0x0020;
+pub const TPM_NONOTIFY: u32 = 0x0080;
 pub const CS_HREDRAW: u32 = 0x0002;
 pub const CS_VREDRAW: u32 = 0x0001;
 pub const SW_SHOW: i32 = 5;
+pub const SW_SHOWMINIMIZED: i32 = 2;
 pub const CW_USEDEFAULT: i32 = i32::MIN;
 
 // 消息
@@ -66,12 +101,22 @@ pub const WM_SETFONT: u32 = 0x0030;
 pub const WM_NOTIFY: u32 = 0x004E;
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_TIMER: u32 = 0x0113;
+/// 批量修改列表前关闭重绘，改完再打开（Win32 标准做法，避免逐行重绘）
+pub const WM_SETREDRAW: u32 = 0x000B;
 pub const WM_CONTEXTMENU: u32 = 0x007B;
+pub const WM_NCDESTROY: u32 = 0x0082;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_SETFOCUS: u32 = 0x0007;
 pub const EN_CHANGE: u32 = 0x0300;
+pub const VK_RETURN: usize = 0x0D;
+pub const VK_ESCAPE: usize = 0x1B;
+/// `PeekMessageW` 的 wRemoveMsg
+pub const PM_REMOVE: u32 = 0x0001;
 
 // 弹出菜单
 pub const MF_STRING: u32 = 0x0000;
 pub const MF_SEPARATOR: u32 = 0x0800;
+pub const MF_GRAYED: u32 = 0x0000_0001;
 pub const TPM_RETURNCMD: u32 = 0x0100;
 pub const TPM_RIGHTBUTTON: u32 = 0x0002;
 pub const SW_SHOWNORMAL: i32 = 1;
@@ -152,7 +197,18 @@ pub const DT_SINGLELINE: u32 = 0x0020;
 pub const DT_END_ELLIPSIS: u32 = 0x8000;
 
 pub const ICC_LISTVIEW_CLASSES: u32 = 0x0000_0001;
+pub const ICC_TAB_CLASSES: u32 = 0x0000_0008;
 pub const GWLP_USERDATA: i32 = -21;
+
+// Tab 控件（系统原生）
+pub const TCM_FIRST: u32 = 0x1300;
+pub const TCM_GETCURSEL: u32 = TCM_FIRST + 11;
+pub const TCM_INSERTITEMW: u32 = TCM_FIRST + 62;
+pub const TCM_SETCURSEL: u32 = TCM_FIRST + 12;
+pub const TCM_ADJUSTRECT: u32 = TCM_FIRST + 40;
+/// `TCN_SELCHANGE`（TCN_FIRST - 1）
+pub const TCN_SELCHANGE: i32 = -551;
+pub const TCIF_TEXT: u32 = 0x0001;
 pub const IDC_ARROW: usize = 32512;
 
 /// COLORREF：0x00BBGGRR
@@ -259,12 +315,73 @@ pub struct INITCOMMONCONTROLSEX {
     pub dwICC: u32,
 }
 
+/// `NOTIFYICONDATAW`（Vista+ 版本）。64 位下 `size_of` 为 976，与系统约定一致。
+#[repr(C)]
+pub struct NOTIFYICONDATAW {
+    pub cbSize: u32,
+    pub hWnd: HWND,
+    pub uID: u32,
+    pub uFlags: u32,
+    pub uCallbackMessage: u32,
+    pub hIcon: isize,
+    pub szTip: [u16; 128],
+    pub dwState: u32,
+    pub dwStateMask: u32,
+    pub szInfo: [u16; 256],
+    pub uTimeoutOrVersion: u32,
+    pub szInfoTitle: [u16; 64],
+    pub dwInfoFlags: u32,
+    pub guidItem: [u8; 16],
+    pub hBalloonIcon: isize,
+}
+
+impl NOTIFYICONDATAW {
+    pub fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+
+    pub fn set_tip(&mut self, tip: &str) {
+        let mut i = 0;
+        for c in tip.encode_utf16().take(self.szTip.len() - 1) {
+            self.szTip[i] = c;
+            i += 1;
+        }
+        self.szTip[i] = 0;
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct NMHDR {
     pub hwndFrom: HWND,
     pub idFrom: usize,
     pub code: u32,
+}
+
+/// `TCITEMW`（仅使用文本字段）。
+#[repr(C)]
+pub struct TCITEMW {
+    pub mask: u32,
+    pub dwState: u32,
+    pub dwStateMask: u32,
+    pub pszText: *mut u16,
+    pub cchTextMax: i32,
+    pub iImage: i32,
+    pub lParam: isize,
+}
+
+impl TCITEMW {
+    pub fn text(text: &mut [u16]) -> TCITEMW {
+        TCITEMW {
+            mask: TCIF_TEXT,
+            dwState: 0,
+            dwStateMask: 0,
+            pszText: text.as_mut_ptr(),
+            cchTextMax: text.len() as i32,
+            iImage: -1,
+            lParam: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -389,6 +506,13 @@ unsafe extern "system" {
     pub fn PostQuitMessage(nExitCode: i32);
     pub fn SendMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
     pub fn PostMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> BOOL;
+    pub fn PeekMessageW(
+        lpMsg: *mut MSG,
+        hWnd: HWND,
+        wMsgFilterMin: u32,
+        wMsgFilterMax: u32,
+        wRemoveMsg: u32,
+    ) -> BOOL;
     pub fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> BOOL;
     pub fn MoveWindow(
         hWnd: HWND,
@@ -438,6 +562,8 @@ unsafe extern "system" {
     ) -> i32;
     pub fn DestroyMenu(hMenu: HMENU) -> BOOL;
     pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
+    pub fn LoadIconW(hInstance: HINSTANCE, lpIconName: *const u16) -> isize;
+    pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
 }
 
 #[link(name = "shell32")]
@@ -450,6 +576,7 @@ unsafe extern "system" {
         lpDirectory: *const u16,
         nShowCmd: i32,
     ) -> isize;
+    pub fn Shell_NotifyIconW(dwMessage: u32, lpData: *mut NOTIFYICONDATAW) -> BOOL;
 }
 
 #[link(name = "gdi32")]
@@ -618,6 +745,29 @@ pub unsafe fn lv_clear_selection(lv: HWND) {
     for i in 0..count {
         lv_select_row(lv, i, false);
     }
+}
+
+/// 设置控件文本。
+pub unsafe fn set_text(hwnd: HWND, s: &str) {
+    let t = w(s);
+    SetWindowTextW(hwnd, t.as_ptr());
+}
+
+/// 向 Tab 控件插入一页。
+pub unsafe fn tab_add(tab: HWND, index: i32, title: &str) {
+    let mut text = w(title);
+    let mut item = TCITEMW::text(&mut text);
+    SendMessageW(
+        tab,
+        TCM_INSERTITEMW,
+        index as WPARAM,
+        &mut item as *mut TCITEMW as LPARAM,
+    );
+}
+
+/// 当前选中的 Tab 页索引。
+pub unsafe fn tab_cur_sel(tab: HWND) -> i32 {
+    SendMessageW(tab, TCM_GETCURSEL, 0, 0) as i32
 }
 
 /// 取控件文本。

@@ -31,8 +31,8 @@ impl Change {
 pub enum SysmemCmd {
     /// 只读诊断
     Status,
-    /// 变更某项系统配置
-    Change { kind: Change, enable: bool },
+    /// 变更某项系统配置；`action` 为 `None` 表示未给出 `--enable/--disable`（只显示状态）
+    Change { kind: Change, action: Option<bool> },
     /// 恢复本工具上次修改前的配置
     Restore { kind: Option<Change> },
     /// 查看变更记录
@@ -66,6 +66,8 @@ pub enum Command {
         budget: usize,
         /// 等待持续压力确认的最长秒数（0 表示不等待，仅报告“压力尚未确认”）
         wait_secs: u64,
+        /// 执行后进行 1 分钟 / 5 分钟效果跟踪
+        track: bool,
     },
     Trim {
         pids: Vec<u32>,
@@ -87,6 +89,18 @@ pub enum Command {
     },
     Config {
         init: bool,
+        /// 只把配置模板打印到标准输出（不读写任何文件，便于打包与文档）
+        template: bool,
+    },
+    Update {
+        /// 只检查并报告，不下载
+        check_only: bool,
+        /// 跳过确认
+        yes: bool,
+        /// 覆盖更新源（owner/name）
+        repo: Option<String>,
+        /// 更新成功后自动重启
+        restart: bool,
     },
     History,
     Help,
@@ -111,7 +125,10 @@ impl Opts {
     }
 
     fn value(&self, k: &str) -> Option<&str> {
-        self.vals.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str())
+        self.vals
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -288,9 +305,31 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }
         "kill" | "close" => parse_kill(&mut c),
         "config" | "cfg" => {
-            let o = collect(&mut c, &[], &["init"])?;
+            let o = collect(&mut c, &[], &["init", "template"])?;
             reject_positional(&o, "config")?;
-            Ok(Command::Config { init: o.has("init") })
+            Ok(Command::Config {
+                init: o.has("init"),
+                template: o.has("template"),
+            })
+        }
+        "update" | "upgrade" => {
+            let o = collect(&mut c, &["repo"], &["check", "yes", "restart"])?;
+            reject_positional(&o, "update")?;
+            let repo = o
+                .value("repo")
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(r) = &repo {
+                if !r.contains('/') {
+                    return Err("--repo 需要 owner/name 形式的仓库名".into());
+                }
+            }
+            Ok(Command::Update {
+                check_only: o.has("check"),
+                yes: o.has("yes"),
+                repo,
+                restart: o.has("restart"),
+            })
         }
         "history" | "hist" => {
             let o = collect(&mut c, &[], &[])?;
@@ -305,11 +344,7 @@ fn reject_positional(o: &Opts, cmd: &str) -> Result<(), String> {
     if o.pos.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "{} 不接受位置参数：{}",
-            cmd,
-            o.pos.join(" ")
-        ))
+        Err(format!("{} 不接受位置参数：{}", cmd, o.pos.join(" ")))
     }
 }
 
@@ -328,7 +363,7 @@ fn parse_list(c: &mut Cursor) -> Result<Command, String> {
 }
 
 fn parse_optimize(c: &mut Cursor) -> Result<Command, String> {
-    let o = collect(c, &["budget", "wait"], &["dry-run", "dry_run"])?;
+    let o = collect(c, &["budget", "wait"], &["dry-run", "dry_run", "track"])?;
     reject_positional(&o, "optimize")?;
     let budget = parse_usize(&o, "budget")?.unwrap_or(0);
     // 默认等待 90 秒：比 press_hold_secs(30s) 更长，才有机会确认“持续压力”
@@ -337,12 +372,13 @@ fn parse_optimize(c: &mut Cursor) -> Result<Command, String> {
         dry_run: o.has("dry-run") || o.has("dry_run"),
         budget,
         wait_secs,
+        track: o.has("track"),
     })
 }
 
 fn parse_trim(c: &mut Cursor) -> Result<Command, String> {
     let o = collect(c, &["pid", "name"], &["dry-run"])?;
-    let pids = parse_pids(&o, "pid")?;
+    let mut pids = parse_pids(&o, "pid")?;
     let mut names = Vec::new();
     if let Some(n) = o.value("name") {
         names.extend(split_names(n));
@@ -399,12 +435,7 @@ fn parse_auto(c: &mut Cursor) -> Result<Command, String> {
         None => None,
         Some(v) => match parse_bool_word(v) {
             Some(b) => Some(b),
-            None => {
-                return Err(format!(
-                    "参数 --startup 的值“{}”非法（只接受 on/off）",
-                    v
-                ))
-            }
+            None => return Err(format!("参数 --startup 的值“{}”非法（只接受 on/off）", v)),
         },
     };
 
@@ -474,13 +505,12 @@ fn sysmem_change(c: &mut Cursor, kind: Change) -> Result<Command, String> {
             kind.id()
         ));
     }
-    if !enable && !disable {
-        return Ok(Command::Sysmem(SysmemCmd::Change {
-            kind,
-            enable: false,
-        }));
-    }
-    Ok(Command::Sysmem(SysmemCmd::Change { kind, enable }))
+    let action = match (enable, disable) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    };
+    Ok(Command::Sysmem(SysmemCmd::Change { kind, action }))
 }
 
 fn parse_kill(c: &mut Cursor) -> Result<Command, String> {
@@ -532,14 +562,20 @@ mod tests {
             let c = parse_str(&format!("sysmem {} --enable", name)).unwrap();
             assert_eq!(
                 c,
-                Command::Sysmem(SysmemCmd::Change { kind, enable: true }),
+                Command::Sysmem(SysmemCmd::Change {
+                    kind,
+                    action: Some(true)
+                }),
                 "{} --enable 解析错误",
                 name
             );
             let c = parse_str(&format!("sysmem {} --disable", name)).unwrap();
             assert_eq!(
                 c,
-                Command::Sysmem(SysmemCmd::Change { kind, enable: false })
+                Command::Sysmem(SysmemCmd::Change {
+                    kind,
+                    action: Some(false)
+                })
             );
         }
     }
@@ -551,12 +587,12 @@ mod tests {
 
     #[test]
     fn sysmem_change_without_action_requests_report_only() {
-        // 没有 --enable/--disable 时，命令仍可解析（上层只显示当前状态）
+        // 没有 --enable/--disable 时 action 为 None（上层只显示当前状态，不修改）
         assert_eq!(
             parse_str("sysmem pagefile").unwrap(),
             Command::Sysmem(SysmemCmd::Change {
                 kind: Change::AutomaticPagefile,
-                enable: false
+                action: None
             })
         );
     }
@@ -671,22 +707,26 @@ mod tests {
                 dry_run,
                 budget,
                 wait_secs,
+                track,
             } => {
                 assert!(!dry_run);
                 assert_eq!(budget, 0);
                 assert!(wait_secs >= 30, "默认应等待足够长以确认持续压力");
+                assert!(!track, "跟踪默认关闭（避免长时间占用终端）");
             }
             other => panic!("{:?}", other),
         }
-        match parse_str("optimize --dry-run --budget 4 --wait 0").unwrap() {
+        match parse_str("optimize --dry-run --budget 4 --wait 0 --track").unwrap() {
             Command::Optimize {
                 dry_run,
                 budget,
                 wait_secs,
+                track,
             } => {
                 assert!(dry_run);
                 assert_eq!(budget, 4);
                 assert_eq!(wait_secs, 0);
+                assert!(track);
             }
             other => panic!("{:?}", other),
         }
@@ -751,13 +791,73 @@ mod tests {
     }
 
     #[test]
+    fn update_command_parsing() {
+        let plain = Command::Update {
+            check_only: false,
+            yes: false,
+            repo: None,
+            restart: false,
+        };
+        assert_eq!(parse_str("update").unwrap(), plain);
+        assert_eq!(
+            parse_str("upgrade --check").unwrap(),
+            Command::Update {
+                check_only: true,
+                yes: false,
+                repo: None,
+                restart: false,
+            }
+        );
+        assert_eq!(
+            parse_str("update --yes --restart").unwrap(),
+            Command::Update {
+                check_only: false,
+                yes: true,
+                repo: None,
+                restart: true,
+            }
+        );
+        assert_eq!(
+            parse_str("update --repo someone/fork").unwrap(),
+            Command::Update {
+                check_only: false,
+                yes: false,
+                repo: Some("someone/fork".into()),
+                restart: false,
+            }
+        );
+        // 仓库名必须是 owner/name
+        assert!(parse_str("update --repo broken").is_err());
+        assert!(parse_str("update --repo").is_err());
+        // --check 是开关，不应该被当成「缺值」
+        assert!(parse_str("update --check").is_ok());
+    }
+
+    #[test]
     fn simple_commands() {
         assert_eq!(parse_str("status").unwrap(), Command::Status);
         assert_eq!(parse_str("standby").unwrap(), Command::Standby);
         assert_eq!(parse_str("history").unwrap(), Command::History);
         assert_eq!(
             parse_str("config --init").unwrap(),
-            Command::Config { init: true }
+            Command::Config {
+                init: true,
+                template: false
+            }
+        );
+        assert_eq!(
+            parse_str("config --template").unwrap(),
+            Command::Config {
+                init: false,
+                template: true
+            }
+        );
+        assert_eq!(
+            parse_str("config").unwrap(),
+            Command::Config {
+                init: false,
+                template: false
+            }
         );
         assert_eq!(parse_str("help").unwrap(), Command::Help);
         assert_eq!(parse_str("--version").unwrap(), Command::Version);

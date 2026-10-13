@@ -10,6 +10,7 @@
 //! - [`config`]：用户配置、保护名单与自动优化允许名单
 //! - [`report`]：报告格式化与历史记录
 //! - [`term`]：终端渲染
+//! - [`update`]：热更新（检查 → 下载 → 校验 SHA-256 → 替换 → 重启）
 
 #[cfg(not(windows))]
 compile_error!("winmem 仅支持 Windows 平台。");
@@ -24,4 +25,5 @@ pub mod report;
 pub mod sysmem;
 pub mod term;
 pub mod track;
+pub mod update;
 pub mod win;

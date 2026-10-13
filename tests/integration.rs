@@ -206,6 +206,47 @@ fn auto_session_with_empty_allow_list_never_trims() {
 }
 
 #[test]
+fn optimize_mutex_is_exclusive_across_threads() {
+    // 单任务互斥：一个线程持有时，其它线程（= 其它实例/任务）必须拿不到，
+    // 从而禁止多个优化任务并行执行。使用测试专用名称，避免与真实任务互相干扰。
+    let name = format!("Local\\winmem-test-mutex-{}", std::process::id());
+    let owned_name = name.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let guard = win::NamedMutex::try_acquire(&owned_name);
+        assert!(guard.is_some(), "首次应能获取互斥体");
+        let _ = tx.send(());
+        std::thread::sleep(Duration::from_millis(1500));
+        drop(guard);
+    });
+    let _ = rx.recv();
+
+    assert!(
+        win::NamedMutex::try_acquire(&name).is_none(),
+        "其它线程持有时不得再次获取（禁止并行优化）"
+    );
+    let _ = handle.join();
+    assert!(
+        win::NamedMutex::try_acquire(&name).is_some(),
+        "释放后应能重新获取"
+    );
+}
+
+#[test]
+fn preview_plan_uses_the_same_policy_as_execution() {
+    // 预览（GUI 展示 / --dry-run）与真实执行必须走同一套策略：
+    // 允许名单为空时，预览同样不能给出任何候选。
+    let cfg = winmem::config::Config::default();
+    let mut engine = Engine::new(cfg);
+    let plan = engine.preview_plan();
+    assert!(
+        plan.candidates().next().is_none(),
+        "允许名单为空时预览也不应给出候选"
+    );
+    assert!(plan.skipped().next().is_some(), "应给出明确的跳过原因");
+}
+
+#[test]
 fn system_snapshot_reports_real_values() {
     let mut engine = Engine::new(Default::default());
     let snap = engine.system_snapshot().expect("应能读取系统内存状态");

@@ -42,6 +42,11 @@ pub struct PolicyConfig {
     pub auto_allow_unlisted: bool,
     /// 后台采样间隔（秒）
     pub sample_interval_secs: u64,
+    /// 一次性运行（无历史样本）建立差分基线的等待时长（毫秒）。
+    ///
+    /// CPU / I/O 活动必须由两次采样差分得到；一次性运行需要先采一次基线，
+    /// 再等待这段时间，活动指标才可用（否则一律「未知」并被保守跳过）。
+    pub baseline_gap_ms: u64,
 }
 
 impl Default for PolicyConfig {
@@ -63,12 +68,13 @@ impl Default for PolicyConfig {
             busy_cpu_percent: 5.0,
             auto_allow_unlisted: false,
             sample_interval_secs: 5,
+            baseline_gap_ms: 600,
         }
     }
 }
 
 /// 应用级配置。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub policy: PolicyConfig,
     /// 用户保护名单（进程名，忽略大小写与 .exe 后缀）
@@ -83,10 +89,37 @@ pub struct Config {
     pub start_with_windows: bool,
     /// 关闭窗口时最小化到托盘（默认开启）
     pub minimize_to_tray: bool,
+    /// 是否在启动时后台检查更新（默认开启）。
+    ///
+    /// **只检查与提示，绝不自动下载或安装**：任何替换都必须经用户确认。
+    pub auto_update_check: bool,
+    /// 更新源仓库（`owner/name`）
+    pub update_repo: String,
+    /// 上次检查更新的 Unix 时间戳（秒）；0 表示从未检查
+    pub last_update_check: u64,
     /// 配置文件路径（加载失败时仍为空）
     pub path: Option<PathBuf>,
     /// 加载过程中的告警（未知键、值非法等）
     pub warnings: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            policy: PolicyConfig::default(),
+            protect: Vec::new(),
+            allow: Vec::new(),
+            auto_enabled: false,
+            auto_intro_shown: false,
+            start_with_windows: false,
+            minimize_to_tray: true,
+            auto_update_check: true,
+            update_repo: crate::update::DEFAULT_REPO.to_string(),
+            last_update_check: 0,
+            path: None,
+            warnings: Vec::new(),
+        }
+    }
 }
 
 impl Config {
@@ -160,6 +193,7 @@ impl Config {
                 "sample_interval_secs" => {
                     set_u64(&mut p.sample_interval_secs, v, k, &mut cfg.warnings)
                 }
+                "baseline_gap_ms" => set_u64(&mut p.baseline_gap_ms, v, k, &mut cfg.warnings),
                 "auto_allow_unlisted" => {
                     set_bool(&mut p.auto_allow_unlisted, v, k, &mut cfg.warnings)
                 }
@@ -169,6 +203,20 @@ impl Config {
                     set_bool(&mut cfg.start_with_windows, v, k, &mut cfg.warnings)
                 }
                 "minimize_to_tray" => set_bool(&mut cfg.minimize_to_tray, v, k, &mut cfg.warnings),
+                "auto_update_check" => {
+                    set_bool(&mut cfg.auto_update_check, v, k, &mut cfg.warnings)
+                }
+                "update_repo" => {
+                    if v.is_empty() {
+                        cfg.warnings.push(format!("{} 不能为空，已保留默认", k));
+                    } else if !v.contains('/') {
+                        cfg.warnings
+                            .push(format!("{} 应为 owner/name 形式，已保留默认", k));
+                    } else {
+                        cfg.update_repo = v.to_string();
+                    }
+                }
+                "last_update_check" => set_u64(&mut cfg.last_update_check, v, k, &mut cfg.warnings),
                 "protect" => cfg.protect = split_list(v),
                 "allow" => cfg.allow = split_list(v),
                 other => cfg.warnings.push(format!("未知配置项：{}", other)),
@@ -213,6 +261,15 @@ impl Config {
         );
         map.insert("minimize_to_tray".into(), self.minimize_to_tray.to_string());
         map.insert(
+            "auto_update_check".into(),
+            self.auto_update_check.to_string(),
+        );
+        map.insert("update_repo".into(), self.update_repo.clone());
+        map.insert(
+            "last_update_check".into(),
+            self.last_update_check.to_string(),
+        );
+        map.insert(
             "auto_allow_unlisted".into(),
             self.policy.auto_allow_unlisted.to_string(),
         );
@@ -252,6 +309,7 @@ impl Config {
             "sample_interval_secs".into(),
             p.sample_interval_secs.to_string(),
         );
+        map.insert("baseline_gap_ms".into(), p.baseline_gap_ms.to_string());
 
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         let mut out = String::new();
@@ -305,7 +363,10 @@ impl Config {
     pub fn fingerprint(&self) -> u64 {
         let p = &self.policy;
         let mut s = String::new();
-        s.push_str(&format!("auto={};unlisted={};", self.auto_enabled, p.auto_allow_unlisted));
+        s.push_str(&format!(
+            "auto={};unlisted={};",
+            self.auto_enabled, p.auto_allow_unlisted
+        ));
         s.push_str("protect=");
         s.push_str(&self.protect.join(","));
         s.push_str(";allow=");
@@ -357,6 +418,14 @@ start_with_windows = false
 # 关闭窗口时最小化到托盘而不是退出
 minimize_to_tray = true
 
+# ---- 热更新 ----
+# 启动时后台检查更新（只提示，绝不自动下载/安装）
+auto_update_check = true
+# 更新源仓库（owner/name）
+update_repo = {}
+# 上次检查更新的 Unix 时间戳（程序自己维护，无需手改）
+last_update_check = 0
+
 # ---- 压力判定 ----
 press_enter_free_ratio = {}
 press_exit_free_ratio = {}
@@ -374,7 +443,10 @@ min_candidate_ws_mb = {}
 recent_foreground_secs = {}
 busy_cpu_percent = {}
 sample_interval_secs = {}
+# 一次性运行时建立 CPU / I/O 差分基线的等待时长（毫秒）
+baseline_gap_ms = {}
 ",
+            crate::update::DEFAULT_REPO,
             d.press_enter_free_ratio,
             d.press_exit_free_ratio,
             d.press_hold_secs,
@@ -388,7 +460,8 @@ sample_interval_secs = {}
             d.min_candidate_ws / (1024 * 1024),
             d.recent_foreground_secs,
             d.busy_cpu_percent,
-            d.sample_interval_secs
+            d.sample_interval_secs,
+            d.baseline_gap_ms
         )
     }
 }
@@ -521,8 +594,10 @@ auto_enabled = yes
         d.protect.push("x".into());
         assert_ne!(a.fingerprint(), d.fingerprint(), "保护名单变化必须改变指纹");
 
-        let mut e = Config::default();
-        e.auto_enabled = true;
+        let e = Config {
+            auto_enabled: true,
+            ..Default::default()
+        };
         assert_ne!(a.fingerprint(), e.fingerprint(), "开关变化必须改变指纹");
 
         let mut f = Config::default();

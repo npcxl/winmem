@@ -1,0 +1,280 @@
+name: Release
+
+# 发布 + 热更新素材。
+#
+# 触发方式：
+#   1. 改 Cargo.toml 的 version 后 push 到 main —— 自动打 tag vX.Y.Z 并发布（推荐，最省事）；
+#   2. push 一个 v* tag —— 直接发布该 tag；
+#   3. 手动触发（workflow_dispatch）—— 指定已存在的 tag，产物先作为草稿待确认。
+#
+# 产物：winmem.exe / winmem-gui.exe / zip / 各自 SHA-256 / latest.json（客户端热更新清单）。
+# 若 tag 已经存在且已有对应 Release，则本次自动跳过（可安全重复推送）。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签（例如 v0.1.0）。留空则取当前分支上的 Cargo.toml 版本"
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  ZIP_NAME: winmem-x86_64-pc-windows-msvc.zip
+  TARGET: x86_64-pc-windows-msvc
+
+# 发布不允许并发：两次发布同时跑会互相覆盖 Release
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 决定「要不要发」以及「发哪个 tag」
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: 解析版本
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析 Cargo 版本与目标 tag
+        id: meta
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $refType  = "${{ github.ref_type }}"
+          $inputTag = "${{ inputs.tag }}".Trim()
+
+          $line = Select-String -Path Cargo.toml -Pattern '^\s*version\s*=\s*"([^"]+)"' |
+                  Select-Object -First 1
+          if (-not $line) { throw "无法从 Cargo.toml 读取 version" }
+          $cargoVersion = $line.Matches[0].Groups[1].Value
+
+          if ($refType -eq 'tag') {
+            $tag = "${{ github.ref_name }}"
+          } elseif ($inputTag -ne '') {
+            $tag = $inputTag
+          } else {
+            $tag = "v$cargoVersion"
+          }
+
+          if ($tag -notmatch '^v\d+\.\d+\.\d+') {
+            throw "标签必须是 vX.Y.Z 形式，当前为 '$tag'"
+          }
+          if ($tag -ne "v$cargoVersion") {
+            throw "标签与 Cargo.toml 版本不一致：标签 $tag，Cargo.toml $cargoVersion"
+          }
+
+          # 该 tag 是否已经发布过？已经发布则本次跳过（重复推送是安全的）
+          $already = $false
+          gh release view $tag --repo "${{ github.repository }}" 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) { $already = $true }
+
+          if (-not $already) {
+            $exists = (git rev-parse -q --verify "refs/tags/$tag") -ne $null
+            if (-not $exists) {
+              if ($refType -eq 'tag' -or $inputTag -ne '') {
+                throw "标签 $tag 不存在；手动发布前请先创建并推送该标签"
+              }
+              # 分支推送：按当前提交创建标签并推送。
+              # 注意：用 GITHUB_TOKEN 推送的 tag 不会再触发新的 workflow，不会出现重复发布。
+              git tag $tag
+              git push origin $tag
+              Write-Host "已创建并推送标签：$tag"
+            }
+          }
+
+          $prerelease = if ($tag -match '-') { "true" } else { "false" }
+          $should     = if ($already) { "false" } else { "true" }
+          Write-Host "tag=$tag version=$cargoVersion prerelease=$prerelease should_release=$should"
+
+          "tag=$tag"                     >> $env:GITHUB_OUTPUT
+          "version=$cargoVersion"        >> $env:GITHUB_OUTPUT
+          "prerelease=$prerelease"       >> $env:GITHUB_OUTPUT
+          "should_release=$should"       >> $env:GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # 构建并发布
+  # ---------------------------------------------------------------------------
+  release:
+    name: 构建并发布（Windows x64）
+    needs: resolve
+    if: needs.resolve.outputs.should_release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 构建的必须就是被发布的那个提交
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 发布构建
+        run: cargo build --release --locked --target ${{ env.TARGET }}
+
+      - name: 组装发布包
+        shell: pwsh
+        run: |
+          $dist = "dist"
+          $bin  = "target/${{ env.TARGET }}/release"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          Copy-Item "$bin/winmem.exe"     $dist
+          Copy-Item "$bin/winmem-gui.exe" $dist
+          Copy-Item "README.md"           $dist
+
+          # 不带 BOM 的 UTF-8：记事本与配置解析器都不应看到多余的 BOM
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          # 用程序自己的模板生成示例配置，避免与代码里的默认值脱节
+          $template = (& "$bin/winmem.exe" config --template | Out-String)
+          [System.IO.File]::WriteAllText("$dist/config.example.ini", $template, $utf8)
+
+          $ver = "${{ needs.resolve.outputs.version }}"
+          $notes = @(
+            "winmem $ver（Windows x64，免安装）",
+            "",
+            "  winmem.exe     命令行界面",
+            "  winmem-gui.exe 图形界面（双击运行；关闭窗口默认收进托盘）",
+            "",
+            "配置与历史记录位于 %APPDATA%\winmem\，示例配置见 config.example.ini。",
+            "首次使用建议先执行：winmem config --init",
+            "程序内热更新：右键菜单「检查更新…」，或 winmem update --check",
+            "内存压缩 / 页面合并等系统配置变更需要管理员权限。"
+          ) -join "`r`n"
+          [System.IO.File]::WriteAllText("$dist/使用说明.txt", $notes, $utf8)
+
+          Get-ChildItem $dist | Select-Object Name, Length
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          foreach ($f in @("winmem.exe", "winmem-gui.exe", "README.md", "config.example.ini", "使用说明.txt")) {
+            $p = Join-Path "dist" $f
+            if (-not (Test-Path $p)) { throw "缺少产物：$f" }
+            if ((Get-Item $p).Length -eq 0) { throw "产物为空：$f" }
+          }
+
+          # Common Controls v6 依赖必须真的写进了 manifest
+          $bin = [System.IO.File]::ReadAllText("dist/winmem-gui.exe")
+          if ($bin -notmatch "Microsoft.Windows.Common-Controls") {
+            throw "winmem-gui.exe 未嵌入 Common Controls v6 manifest"
+          }
+
+      - name: 打包并生成校验和
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath $env:ZIP_NAME -Force
+          foreach ($f in @($env:ZIP_NAME, "dist/winmem.exe", "dist/winmem-gui.exe")) {
+            $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+            "$hash  $(Split-Path $f -Leaf)" |
+              Out-File -Encoding ascii "$(Split-Path $f -Leaf).sha256"
+            Write-Host "$(Split-Path $f -Leaf)  SHA256=$hash"
+          }
+
+      - name: 创建 GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ needs.resolve.outputs.tag }}"
+          $args = @(
+            "release", "create", $tag,
+            "$env:ZIP_NAME", "$env:ZIP_NAME.sha256",
+            "dist/winmem.exe", "dist/winmem.exe.sha256",
+            "dist/winmem-gui.exe", "dist/winmem-gui.exe.sha256",
+            "--title", "winmem $tag",
+            "--generate-notes"
+          )
+          if ("${{ needs.resolve.outputs.prerelease }}" -eq "true") { $args += "--prerelease" }
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            # 手动触发：先建草稿，人工确认后再公开
+            $args += "--draft"
+          }
+          gh @args
+          Write-Host "`nRelease 已创建：$tag"
+
+      - name: 生成热更新清单 latest.json
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag  = "${{ needs.resolve.outputs.tag }}"
+          $repo = "${{ github.repository }}"
+          $base = "https://github.com/$repo/releases/download/$tag"
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          # Release 正文（也就是更新说明）直接进清单，客户端可展示
+          $body = (gh release view $tag --repo $repo --json body -q .body) -join "`n"
+          if ($body.Length -gt 4000) { $body = $body.Substring(0, 4000) }
+
+          $items = @()
+          foreach ($f in @("winmem.exe", "winmem-gui.exe", $env:ZIP_NAME)) {
+            $path = if ($f -eq $env:ZIP_NAME) { $f } else { "dist/$f" }
+            $items += [ordered]@{
+              name   = $f
+              url    = "$base/$f"
+              sha256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+              size   = (Get-Item $path).Length
+            }
+          }
+
+          $manifest = [ordered]@{
+            schema       = 1
+            tag          = $tag
+            version      = "${{ needs.resolve.outputs.version }}"
+            published_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            notes        = $body
+            assets       = $items
+          }
+          $json = $manifest | ConvertTo-Json -Depth 6
+          [System.IO.File]::WriteAllText("latest.json", $json, $utf8)
+          Get-Content latest.json
+
+          gh release upload $tag latest.json --repo $repo --clobber
+          Write-Host "已上传 latest.json（客户端通过 releases/latest/download/latest.json 获取）"
+
+      - name: 上传工作流产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: winmem-${{ needs.resolve.outputs.tag }}
+          path: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.ZIP_NAME }}.sha256
+            latest.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 发布摘要
+        shell: pwsh
+        run: |
+          $tag  = "${{ needs.resolve.outputs.tag }}"
+          $repo = "${{ github.repository }}"
+          $lines = @(
+            "## winmem $tag 已发布",
+            "",
+            "- 下载页：https://github.com/$repo/releases/tag/$tag",
+            "- 热更新清单：https://github.com/$repo/releases/latest/download/latest.json",
+            "- 客户端检查更新：winmem update --check"
+          )
+          $lines -join "`n" | Out-File -Encoding utf8 $env:GITHUB_STEP_SUMMARY

@@ -4,19 +4,21 @@
 //! ```text
 //! winmem status                    查看系统内存状态与压力原因
 //! winmem list [--top N]            列出进程指标
-//! winmem optimize [--dry-run]      按统一策略执行一次压力缓解
+//! winmem optimize [--dry-run]      按统一策略执行一次压力缓解（先确认持续压力）
 //! winmem trim --pid 1234           手动裁剪工作集（仍遵守硬保护）
 //! winmem monitor [--auto]          监测模式（默认只观察）
+//! winmem auto                      智能自动优化开关与名单
 //! winmem standby                   手动清空系统待机列表（高级）
 //! winmem kill --pid 1234           手动结束进程（需确认）
-//! winmem config [--init]           查看/生成配置文件
+//! winmem sysmem                    系统内存配置只读诊断
+//! winmem config [--init|--template] 查看/生成/打印配置文件
 //! winmem history                   查看最近的操作记录
 //! ```
 
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
+use winmem::cli::{self, AutoCmd, Change, Command, SysmemCmd};
 use winmem::config::Config;
 use winmem::engine::{AutoEvent, AutoStatus};
 use winmem::engine::{CancelToken, Engine, RunOptions};
@@ -25,106 +27,71 @@ use winmem::policy::{self, Decision, Purpose};
 use winmem::report;
 use winmem::sysmem;
 use winmem::term::{self, Column};
+use winmem::update;
 use winmem::win;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const VALUED_OPTS: &[&str] = &["pid", "name", "top", "sort", "interval", "budget"];
-
 fn main() {
     term::enable_ansi();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        print_help();
-        return;
+    // 上次热更新遗留的备份（*.old）在启动时清理
+    if let Some(exe) = update::self_exe() {
+        update::cleanup_backups(&exe);
     }
-    let (pos, opts) = parse_args(&args);
-    let cmd = pos
-        .first()
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    let rest: Vec<String> = pos.iter().skip(1).cloned().collect();
-
-    match cmd.as_str() {
-        "status" | "st" => cmd_status(),
-        "list" | "ls" | "ps" => cmd_list(&opts, &rest),
-        "optimize" | "opt" => cmd_optimize(&opts),
-        "trim" => cmd_trim(&opts, &rest),
-        "monitor" | "mon" => cmd_monitor(&opts),
-        "auto" => cmd_auto(&opts),
-        "sysmem" | "sys" => cmd_sysmem(&rest),
-        "standby" | "purge" => cmd_standby(),
-        "kill" | "close" => cmd_kill(&opts, &rest, false),
-        "config" | "cfg" => cmd_config(&opts),
-        "history" | "hist" => cmd_history(),
-        "help" | "-h" | "--help" | "?" => print_help(),
-        "version" | "-v" | "--version" => println!("winmem {}", VERSION),
-        other => {
-            eprintln!("{}未知命令：{}{}", term::RED, other, term::RESET);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = match cli::parse(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}参数错误：{}{}", term::RED, e, term::RESET);
             println!();
-            print_help();
+            println!("运行 `winmem help` 查看用法。");
             std::process::exit(2);
         }
+    };
+    dispatch(cmd);
+}
+
+fn dispatch(cmd: Command) {
+    match cmd {
+        Command::Status => cmd_status(),
+        Command::List { top, all, filter } => cmd_list(top, all, filter),
+        Command::Optimize {
+            dry_run,
+            budget,
+            wait_secs,
+            track,
+        } => cmd_optimize(dry_run, budget, wait_secs, track),
+        Command::Trim {
+            pids,
+            names,
+            dry_run,
+        } => cmd_trim(&pids, &names, dry_run),
+        Command::Monitor { interval, auto } => cmd_monitor(interval, auto),
+        Command::Auto(a) => cmd_auto(a),
+        Command::Sysmem(s) => cmd_sysmem(s),
+        Command::Standby => cmd_standby(),
+        Command::Kill {
+            pids,
+            names,
+            force,
+            yes,
+        } => cmd_kill(&pids, &names, force, yes),
+        Command::Config { init, template } => cmd_config(init, template),
+        Command::Update {
+            check_only,
+            yes,
+            repo,
+            restart,
+        } => cmd_update(check_only, yes, repo, restart),
+        Command::History => cmd_history(),
+        Command::Help => print_help(),
+        Command::Version => println!("winmem {}", VERSION),
     }
 }
 
 // ---------------------------------------------------------------------------
-// 参数解析
+// 公共工具
 // ---------------------------------------------------------------------------
-
-fn parse_args(args: &[String]) -> (Vec<String>, HashMap<String, String>) {
-    let mut pos = Vec::new();
-    let mut opts = HashMap::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        let stripped = a.strip_prefix("--").or_else(|| {
-            if a.len() > 1 {
-                a.strip_prefix('-')
-            } else {
-                None
-            }
-        });
-        let Some(rest) = stripped else {
-            pos.push(a.clone());
-            i += 1;
-            continue;
-        };
-        let (key, inline) = match rest.split_once('=') {
-            Some((k, v)) => (k.to_string(), Some(v.to_string())),
-            None => (rest.to_string(), None),
-        };
-        if let Some(v) = inline {
-            opts.insert(key, v);
-        } else if VALUED_OPTS.contains(&key.as_str())
-            && args
-                .get(i + 1)
-                .map(|n| !n.starts_with('-'))
-                .unwrap_or(false)
-        {
-            opts.insert(key, args[i + 1].clone());
-            i += 1;
-        } else {
-            opts.insert(key, "true".to_string());
-        }
-        i += 1;
-    }
-    (pos, opts)
-}
-
-fn flag(opts: &HashMap<String, String>, key: &str) -> bool {
-    opts.contains_key(key)
-}
-
-fn value<'a>(opts: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
-    opts.get(key).map(|s| s.as_str())
-}
-
-fn parse_pids(s: &str) -> Vec<u32> {
-    s.split([',', ';', ' '])
-        .filter_map(|x| x.trim().parse::<u32>().ok())
-        .collect()
-}
 
 fn sanitize(s: &str) -> String {
     s.chars()
@@ -159,6 +126,14 @@ fn load_engine() -> Engine {
         eprintln!("{}配置警告：{}{}", term::YELLOW, w, term::RESET);
     }
     Engine::new(cfg)
+}
+
+fn change_kind(c: Change) -> sysmem::ChangeKind {
+    match c {
+        Change::MemoryCompression => sysmem::ChangeKind::MemoryCompression,
+        Change::PageCombining => sysmem::ChangeKind::PageCombining,
+        Change::AutomaticPagefile => sysmem::ChangeKind::AutomaticPagefile,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +221,10 @@ fn cmd_status() {
     }
     println!();
     println!(
-        "{}提示：单次 status 只反映瞬时状态；持续压力需要 {}winmem monitor{} 观察。{}",
+        "{}提示：单次 status 只反映瞬时状态；持续压力需要 {}winmem optimize{}（会等待确认）或 {}winmem monitor{} 观察。{}",
         term::DIM,
+        term::CYAN,
+        term::RESET,
         term::CYAN,
         term::RESET,
         term::RESET
@@ -256,10 +233,10 @@ fn cmd_status() {
 
 fn process_rows(cfg: &Config, top: Option<usize>, filter: Option<&str>) -> Vec<Vec<String>> {
     let mut sampler = metrics::ProcessSampler::new();
-    // 先采一次以建立差分基线
-    let _ = sampler.collect(false);
+    // 先采一次以建立差分基线（CPU / I/O 需要两次采样）
+    let _ = sampler.collect();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    let mut list = sampler.collect(true);
+    let mut list = sampler.collect();
 
     if let Some(f) = filter {
         let f = f.to_ascii_lowercase();
@@ -276,6 +253,12 @@ fn process_rows(cfg: &Config, top: Option<usize>, filter: Option<&str>) -> Vec<V
 
     list.iter()
         .map(|m| {
+            let activity = match (m.cpu_percent, m.io_active) {
+                (Some(c), Some(true)) => Some(c.max(100.0)),
+                (Some(c), _) => Some(c),
+                (None, Some(true)) => Some(100.0),
+                (None, _) => None,
+            };
             let verdict = policy::decide(&policy::PolicyInput {
                 facts: &policy::ProcessFacts {
                     pid: m.pid,
@@ -285,7 +268,7 @@ fn process_rows(cfg: &Config, top: Option<usize>, filter: Option<&str>) -> Vec<V
                     private_bytes: m.private_bytes.unwrap_or(0),
                     os_critical: m.os_critical,
                     last_foreground_secs: None,
-                    cpu_percent: m.cpu_percent,
+                    cpu_percent: activity,
                     cooling: false,
                     is_self: m.pid == self_pid,
                 },
@@ -320,16 +303,9 @@ fn process_rows(cfg: &Config, top: Option<usize>, filter: Option<&str>) -> Vec<V
         .collect()
 }
 
-fn cmd_list(opts: &HashMap<String, String>, rest: &[String]) {
+fn cmd_list(top: Option<usize>, all: bool, filter: Option<String>) {
     let cfg = Config::load();
-    let top = if flag(opts, "all") {
-        None
-    } else {
-        value(opts, "top").and_then(|v| v.parse().ok()).or(Some(40))
-    };
-    let filter = value(opts, "filter")
-        .map(|s| s.to_string())
-        .or_else(|| rest.first().cloned());
+    let top = if all { None } else { top.or(Some(40)) };
 
     let rows = process_rows(&cfg, top, filter.as_deref());
     let cols = [
@@ -383,6 +359,11 @@ fn cmd_list(opts: &HashMap<String, String>, rest: &[String]) {
         term::RESET
     );
     println!(
+        "{}      CPU 为相对单个逻辑处理器的百分比，多核上可能超过 100%。{}",
+        term::DIM,
+        term::RESET
+    );
+    println!(
         "{}提示：默认只处理自动优化允许名单内的进程，详见 winmem config{}",
         term::DIM,
         term::RESET
@@ -407,7 +388,8 @@ fn print_help() {
     println!("  winmem list [--top N] [--all] [--filter 名]");
     println!("                                   查看进程指标（工作集/私有提交/CPU）");
     println!("  winmem optimize [--dry-run]      按统一策略执行一次压力缓解");
-    println!("      --dry-run                    只显示候选与跳过原因，不执行");
+    println!("      --wait N                     等待持续压力确认的最长秒数（默认 90）");
+    println!("      --track                      执行后做 1 分钟 / 5 分钟效果跟踪");
     println!("      --budget N                   本次最多处理的进程数");
     println!("  winmem trim --pid 1,2 | --name chrome");
     println!("                                   手动裁剪工作集（仍遵守硬保护）");
@@ -417,7 +399,8 @@ fn print_help() {
     println!("  winmem kill --pid 1,2 | --name x 手动结束进程（永不进入自动流程）");
     println!("      --force                      允许处理默认保护但非致命的进程");
     println!("      --yes                        跳过确认（脚本用）");
-    println!("  winmem auto [--on|--off|--allow 名称|--clear-allow|--startup on|off|--run]");
+    println!("  winmem auto [--on|--off] [--allow 名称] [--clear-allow]");
+    println!("             [--startup on|off] [--run]");
     println!("                                   智能自动优化（默认关闭；默认只处理允许名单）");
     println!(
         "  winmem sysmem [status]           系统内存配置只读诊断（压缩/页面合并/分页文件/提交量）"
@@ -427,7 +410,11 @@ fn print_help() {
     println!("                                   系统配置变更（需管理员，可能需重启）");
     println!("  winmem sysmem restore [项目]      恢复本工具上次修改前的配置");
     println!("  winmem sysmem history            查看系统配置变更记录");
-    println!("  winmem config [--init]           查看配置；--init 生成模板");
+    println!("  winmem config [--init|--template]");
+    println!("                                   查看配置；--init 生成模板；--template 打印模板到标准输出");
+    println!("  winmem update [--check] [--yes] [--restart] [--repo owner/name]");
+    println!("                                   热更新：检查 → 下载 → 校验 SHA-256 → 替换自身");
+    println!("                                   --check 只看不装；--restart 装完自动重启");
     println!("  winmem history                   查看最近操作记录");
     println!();
     println!("{}重要说明：{}", term::BOLD, term::RESET);
@@ -455,16 +442,14 @@ fn print_progress(msg: &str) {
     let _ = io::stdout().flush();
 }
 
-fn cmd_optimize(opts: &HashMap<String, String>) {
+fn cmd_optimize(dry: bool, budget: usize, wait_secs: u64, track: bool) {
     let mut engine = load_engine();
-    let dry = flag(opts, "dry-run") || flag(opts, "dry_run");
-    let budget = value(opts, "budget")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
 
     let run_opts = RunOptions {
         dry_run: dry,
         budget,
+        confirm_secs: wait_secs,
+        track,
         ..Default::default()
     };
     let cancel = CancelToken::new();
@@ -479,6 +464,14 @@ fn cmd_optimize(opts: &HashMap<String, String>) {
         engine.config.policy.cooldown_secs,
         term::RESET
     );
+    if !dry {
+        println!(
+            "{}将先等待持续压力确认（最长 {} 秒）；确认不了会明确说明，不会声称“可用内存充足”。{}",
+            term::DIM,
+            wait_secs,
+            term::RESET
+        );
+    }
     println!();
 
     let outcome = engine.run(&run_opts, &cancel, &mut |p| {
@@ -500,9 +493,66 @@ fn cmd_optimize(opts: &HashMap<String, String>) {
 
     println!("{}", report::format_outcome(&outcome));
 
-    let mut history = report::History::default();
-    history.push(&report::History::summarize(&outcome));
-    history.flush();
+    if outcome.observation.trimmed_count > 0 {
+        let mut history = report::History::default();
+        history.push(&report::History::summarize(&outcome));
+        history.flush();
+    }
+
+    // 效果跟踪（默认关闭，--track 开启）
+    if track && outcome.observation.trimmed_count > 0 {
+        println!();
+        println!(
+            "{}开始效果跟踪（{} 秒节点）；等待期间可 Ctrl+C 中断。{}",
+            term::CYAN,
+            engine
+                .config
+                .policy
+                .track_secs
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(" / "),
+            term::RESET
+        );
+        let cancel = CancelToken::new();
+        let points = engine.run_tracking(&outcome, &cancel, &mut |m| print_progress(m));
+        println!("\r{: <74}", "");
+        for p in &points {
+            println!(
+                "  跟踪 {} 秒：可用内存 {}，提交量 {}",
+                p.at_secs,
+                p.avail_phys
+                    .map(term::fmt_bytes)
+                    .unwrap_or_else(|| report::UNKNOWN.into()),
+                p.commit_total
+                    .map(term::fmt_bytes)
+                    .unwrap_or_else(|| report::UNKNOWN.into())
+            );
+            for proc in &p.procs {
+                let state = if proc.alive { "存活" } else { "已退出" };
+                println!(
+                    "    {:>7}  {:<24} {}  工作集 {}{}",
+                    proc.pid,
+                    term::truncate(&proc.name, 24),
+                    state,
+                    proc.working_set
+                        .map(term::fmt_bytes)
+                        .unwrap_or_else(|| report::UNKNOWN.into()),
+                    match proc.regrowth_ratio {
+                        Some(r) => format!("（回涨 {:.0}%）", r * 100.0),
+                        None => "（回涨未知）".to_string(),
+                    }
+                );
+            }
+        }
+    } else if !track && outcome.observation.trimmed_count > 0 {
+        println!(
+            "{}提示：未进行效果跟踪；可用 --track 查看 1 分钟 / 5 分钟的工作集回涨。{}",
+            term::DIM,
+            term::RESET
+        );
+    }
 
     // 提交压力只提示，不用裁剪掩盖
     if let Some(p) = &outcome.plan.pressure {
@@ -521,35 +571,30 @@ fn cmd_optimize(opts: &HashMap<String, String>) {
     }
 }
 
-fn resolve_targets(opts: &HashMap<String, String>, rest: &[String], allow_name: bool) -> Vec<u32> {
-    if let Some(p) = value(opts, "pid") {
-        return parse_pids(p);
-    }
-    let name = value(opts, "name").map(|s| s.to_string()).or_else(|| {
-        if allow_name {
-            rest.first().cloned()
-        } else {
-            None
-        }
-    });
-    if let Some(n) = name {
+fn resolve_targets(pids: &[u32], names: &[String]) -> Vec<u32> {
+    let mut out: Vec<u32> = pids.to_vec();
+    if !names.is_empty() {
         let mut sampler = metrics::ProcessSampler::new();
-        let list = sampler.collect(false);
-        let want = policy::normalize_name(&n);
-        return list
-            .iter()
-            .filter(|m| policy::normalize_name(&m.name) == want)
-            .map(|m| m.pid)
-            .collect();
+        let list = sampler.collect();
+        for n in names {
+            let want = policy::normalize_name(n);
+            if want.is_empty() {
+                continue;
+            }
+            out.extend(
+                list.iter()
+                    .filter(|m| policy::normalize_name(&m.name) == want)
+                    .map(|m| m.pid),
+            );
+        }
     }
-    if let Some(pid) = rest.first().and_then(|s| s.parse::<u32>().ok()) {
-        return vec![pid];
-    }
-    Vec::new()
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
-fn cmd_trim(opts: &HashMap<String, String>, rest: &[String]) {
-    let targets = resolve_targets(opts, rest, true);
+fn cmd_trim(pids: &[u32], names: &[String], dry: bool) {
+    let targets = resolve_targets(pids, names);
     if targets.is_empty() {
         eprintln!(
             "{}没有匹配到进程。用法：winmem trim --pid 1234 或 --name chrome.exe{}",
@@ -560,33 +605,48 @@ fn cmd_trim(opts: &HashMap<String, String>, rest: &[String]) {
     }
 
     let mut engine = load_engine();
+    // 手动裁剪：明确告知会绕过软冷却（这是显式的人工操作）
+    println!();
+    println!(
+        "{}手动操作：将按统一策略释放选中进程的内存；手动操作会绕过“冷却/名单”等软保护，{}",
+        term::YELLOW,
+        term::RESET
+    );
+    println!(
+        "{}      但核心系统进程、其它会话、身份未知等硬/关键保护仍会阻止。{}",
+        term::YELLOW,
+        term::RESET
+    );
     let run_opts = RunOptions {
-        dry_run: flag(opts, "dry-run"),
+        dry_run: dry,
         manual_targets: targets.clone(),
         force_run: true,
         budget: 0,
+        confirm_secs: 0,
+        track: false,
     };
     let cancel = CancelToken::new();
 
-    println!();
     let outcome = engine.run(&run_opts, &cancel, &mut |p| {
         print_progress(&p.message);
     });
     println!("\r{: <74}", "");
 
-    if run_opts.dry_run {
+    if dry {
         print!("{}", report::format_plan(&outcome.plan));
         return;
     }
 
     println!("{}", report::format_outcome(&outcome));
 
-    let mut history = report::History::default();
-    history.push(&format!(
-        "手动 trim：{}",
-        report::History::summarize(&outcome)
-    ));
-    history.flush();
+    if outcome.observation.trimmed_count > 0 {
+        let mut history = report::History::default();
+        history.push(&format!(
+            "手动 trim：{}",
+            report::History::summarize(&outcome)
+        ));
+        history.flush();
+    }
 
     println!(
         "{}注意：EmptyWorkingSet 可能一次移除该进程大量工作集页面，{}",
@@ -604,13 +664,9 @@ fn cmd_trim(opts: &HashMap<String, String>, rest: &[String]) {
 // monitor / standby
 // ---------------------------------------------------------------------------
 
-fn cmd_monitor(opts: &HashMap<String, String>) {
+fn cmd_monitor(interval: u64, auto: bool) {
     let mut engine = load_engine();
-    let interval = value(opts, "interval")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(5)
-        .max(2);
-    let auto = flag(opts, "auto");
+    let interval = interval.max(2);
 
     if auto && !engine.config.auto_enabled {
         eprintln!(
@@ -618,7 +674,7 @@ fn cmd_monitor(opts: &HashMap<String, String>) {
             term::YELLOW,
             term::RESET
         );
-        eprintln!("如需开启，请编辑配置文件后重试。");
+        eprintln!("如需开启，请使用 `winmem auto --on` 后重试。");
         return;
     }
 
@@ -638,15 +694,15 @@ fn cmd_monitor(opts: &HashMap<String, String>) {
 
     let cancel = CancelToken::new();
     let mut round: u64 = 0;
+    engine.establish_baseline();
     loop {
+        engine.poll_foreground();
         let Some(snap) = engine.system_snapshot() else {
             eprintln!("{}采样失败，跳过本轮{}", term::YELLOW, term::RESET);
             std::thread::sleep(std::time::Duration::from_secs(interval));
             continue;
         };
-        let cfg = engine.config.policy.clone();
-        let mut tracker = policy::PressureTracker::new();
-        let rep = tracker.update(&snap, &cfg, metrics::monotonic_secs());
+        let rep = engine.update_pressure(&snap, metrics::monotonic_secs());
         round += 1;
 
         let free_pct = if snap.total_phys > 0 {
@@ -673,9 +729,11 @@ fn cmd_monitor(opts: &HashMap<String, String>) {
             });
             println!("\r{: <74}", "");
             println!("      {}", report::History::summarize(&outcome));
-            let mut h = report::History::default();
-            h.push(&report::History::summarize(&outcome));
-            h.flush();
+            if outcome.observation.trimmed_count > 0 {
+                let mut h = report::History::default();
+                h.push(&report::History::summarize(&outcome));
+                h.flush();
+            }
         }
 
         std::thread::sleep(std::time::Duration::from_secs(interval));
@@ -731,10 +789,8 @@ fn cmd_standby() {
 // kill / config / history
 // ---------------------------------------------------------------------------
 
-fn cmd_kill(opts: &HashMap<String, String>, rest: &[String], _dummy: bool) {
-    let force = flag(opts, "force");
-    let skip_confirm = flag(opts, "yes") || flag(opts, "y");
-    let targets = resolve_targets(opts, rest, true);
+fn cmd_kill(pids: &[u32], names: &[String], force: bool, skip_confirm: bool) {
+    let targets = resolve_targets(pids, names);
     if targets.is_empty() {
         eprintln!(
             "{}没有匹配到进程。用法：winmem kill --pid 1234{}",
@@ -746,7 +802,7 @@ fn cmd_kill(opts: &HashMap<String, String>, rest: &[String], _dummy: bool) {
 
     let cfg = Config::load();
     let mut sampler = metrics::ProcessSampler::new();
-    let list = sampler.collect(false);
+    let list = sampler.collect();
     let self_session = win::current_session();
     let fg = win::foreground_pid();
     let self_pid = win::current_pid();
@@ -873,9 +929,205 @@ fn cmd_kill(opts: &HashMap<String, String>, rest: &[String], _dummy: bool) {
     );
 }
 
-fn cmd_config(opts: &HashMap<String, String>) {
+// ---------------------------------------------------------------------------
+// update：热更新（检查 → 下载 → 校验 → 替换 → 可选重启）
+// ---------------------------------------------------------------------------
+
+/// 版本清单里的链接**只用于展示**，不下载任何东西。
+fn print_release_summary(info: &update::ReleaseInfo, self_name: &str) {
+    println!(
+        "{}发现新版本{} {}（当前 {}）",
+        term::GREEN,
+        term::RESET,
+        info.version,
+        update::current_version()
+    );
+    println!("{}  标签    {}{}", term::DIM, info.tag, term::RESET);
+    if let Some(a) = info.asset(self_name) {
+        let size = a
+            .size
+            .map(|s| format!("{:.1} MB", s as f64 / 1024.0 / 1024.0))
+            .unwrap_or_else(|| "大小未知".into());
+        println!(
+            "{}  更新包  {}（{}）{}",
+            term::DIM,
+            a.name,
+            size,
+            term::RESET
+        );
+        let sha = if a.sha256.len() >= 16 {
+            &a.sha256[..16]
+        } else {
+            &a.sha256
+        };
+        println!(
+            "{}  SHA-256 {}…（下载后校验）{}",
+            term::DIM,
+            sha,
+            term::RESET
+        );
+    } else {
+        println!(
+            "{}  注意：本次发布未提供 {}，无法自动更新{}",
+            term::YELLOW,
+            self_name,
+            term::RESET
+        );
+    }
+    if !info.notes.is_empty() {
+        println!("{}  说明    {}{}", term::DIM, info.notes, term::RESET);
+    }
+}
+
+fn cmd_update(check_only: bool, yes: bool, repo: Option<String>, restart: bool) {
+    let cfg = Config::load();
+    let repo = repo.unwrap_or_else(|| cfg.update_repo.clone());
+
+    let self_exe = match update::self_exe() {
+        Some(p) => p,
+        None => {
+            eprintln!("{}无法确定当前程序路径，已取消。{}", term::RED, term::RESET);
+            std::process::exit(1);
+        }
+    };
+    let self_name = self_exe
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    println!();
+    println!(
+        "{}当前版本{} winmem {}",
+        term::BOLD,
+        term::RESET,
+        update::current_version()
+    );
+    println!(
+        "{}更新源  {}（公开 Release 清单）{}",
+        term::DIM,
+        repo,
+        term::RESET
+    );
+    println!("{}说明    {}{}", term::DIM, update::NOTICE, term::RESET);
+
+    // 清理上次更新遗留的备份（旧进程可能还在退出，失败也不影响本次）
+    let cleaned = update::cleanup_backups(&self_exe);
+    if cleaned > 0 {
+        println!(
+            "{}已清理上次更新遗留的 {} 个备份文件。{}",
+            term::DIM,
+            cleaned,
+            term::RESET
+        );
+    }
+    println!();
+
+    match update::check(&repo) {
+        update::CheckResult::Failed(e) => {
+            eprintln!("{}检查更新失败：{}", term::RED, e);
+            eprintln!("{}", term::RESET);
+            std::process::exit(1);
+        }
+        update::CheckResult::UpToDate { current, latest } => {
+            println!(
+                "{}已是最新版本{}（本地 {}，远端最新 {}）。",
+                term::GREEN,
+                term::RESET,
+                current,
+                latest
+            );
+        }
+        update::CheckResult::Available(info) => {
+            print_release_summary(&info, &self_name);
+            if check_only {
+                println!(
+                    "{}仅检查（--check），未下载任何内容。{}",
+                    term::DIM,
+                    term::RESET
+                );
+                return;
+            }
+            if info.asset(&self_name).is_none() {
+                std::process::exit(1);
+            }
+            println!();
+            if !yes && !confirm("是否下载并替换当前程序？") {
+                println!("{}已取消。{}", term::DIM, term::RESET);
+                return;
+            }
+
+            let sibling = update::sibling_name(&self_name);
+            let report = update::install(&info, &self_exe, &[sibling]);
+            println!("{}安装结果：{}", term::BOLD, term::RESET);
+            for f in &report.files {
+                let mark = if f.ok { "✔" } else { "✖" };
+                let color = if f.ok { term::GREEN } else { term::RED };
+                let extra = f
+                    .backup
+                    .as_ref()
+                    .map(|b| {
+                        format!(
+                            "（原文件备份为 {}）",
+                            b.file_name().unwrap_or_default().to_string_lossy()
+                        )
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "  {}{} {}  {}{}{}",
+                    color,
+                    mark,
+                    f.path.file_name().unwrap_or_default().to_string_lossy(),
+                    f.message,
+                    extra,
+                    term::RESET
+                );
+            }
+
+            if !report.all_ok {
+                // 部分文件没更新成功：可能是目录不可写或本次发布缺少该文件
+                eprintln!(
+                    "\n{}部分文件未更新成功。若目录不可写，请以管理员身份重试。{}",
+                    term::YELLOW,
+                    term::RESET
+                );
+                std::process::exit(1);
+            }
+
+            println!(
+                "\n{}更新已就位，重启程序后生效。{}（备份文件会在下次启动时自动清理）",
+                term::GREEN,
+                term::RESET
+            );
+            if restart {
+                match update::restart(&self_exe, &[]) {
+                    Ok(()) => {
+                        println!("已启动新版本。");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "{}启动新版本失败：{}（请手动重启）{}",
+                            term::YELLOW,
+                            e,
+                            term::RESET
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn cmd_config(init: bool, template: bool) {
     let path = Config::default_path();
-    if flag(opts, "init") {
+
+    // 只打印模板：不读写任何文件，便于打包、生成示例配置与文档
+    if template {
+        print!("{}", Config::template());
+        return;
+    }
+
+    if init {
         let Some(p) = &path else {
             eprintln!("{}无法定位 %APPDATA%{}", term::RED, term::RESET);
             return;
@@ -924,6 +1176,11 @@ fn cmd_config(opts: &HashMap<String, String>) {
     println!("  允许名单：{:?}", cfg.allow);
     println!("  auto_enabled = {}", cfg.auto_enabled);
     println!("  auto_allow_unlisted = {}", cfg.policy.auto_allow_unlisted);
+    match win::autostart_enabled() {
+        Ok(true) => println!("  开机启动 = 已注册（与实际注册表一致）"),
+        Ok(false) => println!("  开机启动 = 未注册"),
+        Err(e) => println!("  开机启动 = 查询失败（{}）", e),
+    }
     for w in &cfg.warnings {
         println!("  {}警告：{}{}", term::YELLOW, w, term::RESET);
     }
@@ -945,11 +1202,11 @@ fn print_auto_intro() {
     println!();
 }
 
-fn cmd_auto(opts: &HashMap<String, String>) {
+fn cmd_auto(a: AutoCmd) {
     let mut cfg = Config::load();
     let mut dirty = false;
 
-    if flag(opts, "on") || flag(opts, "enable") {
+    if a.on {
         if !cfg.auto_intro_shown {
             print_auto_intro();
             cfg.auto_intro_shown = true;
@@ -966,34 +1223,58 @@ fn cmd_auto(opts: &HashMap<String, String>) {
                     term::RESET
                 );
             }
+        } else {
+            println!("{}自动优化已经是开启状态。{}", term::DIM, term::RESET);
         }
     }
-    if flag(opts, "off") || flag(opts, "disable") {
-        cfg.auto_enabled = false;
-        dirty = true;
+    if a.off {
+        if cfg.auto_enabled {
+            cfg.auto_enabled = false;
+            dirty = true;
+        }
         println!(
             "{}已关闭智能自动优化。{}（该开关与系统配置相互独立，不会改动系统设置）",
             term::GREEN,
             term::RESET
         );
     }
-    if let Some(list) = value(opts, "allow") {
-        for name in list.split([',', ';']) {
+    if !a.allow.is_empty() {
+        for name in &a.allow {
             let n = policy::normalize_name(name);
             if !n.is_empty() && !cfg.allow.contains(&n) {
                 cfg.allow.push(n);
             }
         }
         dirty = true;
+        println!("{}允许名单已更新：{}", term::GREEN, cfg.allow.join(", "));
     }
-    if flag(opts, "clear-allow") {
+    if a.clear_allow {
         cfg.allow.clear();
         dirty = true;
+        println!(
+            "{}允许名单已清空（此后只监测不执行）。{}",
+            term::GREEN,
+            term::RESET
+        );
     }
-    if let Some(v) = value(opts, "startup") {
-        cfg.start_with_windows =
-            matches!(v.to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes");
+    if let Some(v) = a.startup {
+        cfg.start_with_windows = v;
         dirty = true;
+        // 实际注册 / 撤销当前用户的开机启动，并读回验证
+        match win::set_autostart(v) {
+            Ok(()) => println!(
+                "{}开机启动已{}，并已读回验证。{}",
+                term::GREEN,
+                if v { "注册" } else { "撤销" },
+                term::RESET
+            ),
+            Err(e) => eprintln!(
+                "{}开机启动变更失败：{}（配置中的开关未生效，请检查权限或手动设置）{}",
+                term::RED,
+                e,
+                term::RESET
+            ),
+        }
     }
 
     if dirty {
@@ -1003,7 +1284,7 @@ fn cmd_auto(opts: &HashMap<String, String>) {
         }
     }
 
-    if flag(opts, "run") || flag(opts, "monitor") {
+    if a.run {
         println!();
         println!(
             "{}前台运行自动会话（Ctrl+C 退出）…{}",
@@ -1019,6 +1300,26 @@ fn cmd_auto(opts: &HashMap<String, String>) {
             AutoEvent::Finished(o) => println!("[完成] {}", report::History::summarize(&o)),
         });
         return;
+    }
+
+    // 仅保存配置 / 查看状态
+    if a.on && !a.off {
+        println!();
+        println!(
+            "{}说明：`winmem auto --on` 只保存配置（记录你希望开启），{}",
+            term::YELLOW,
+            term::RESET
+        );
+        println!(
+            "{}      它不会在命令行进程外持续运行。实际启动后台监测请使用：{}",
+            term::YELLOW,
+            term::RESET
+        );
+        println!("        · winmem auto --run        （前台运行自动会话）");
+        println!("        · 运行 winmem-gui.exe       （图形界面，勾选「智能自动优化」）");
+        if win::autostart_enabled().unwrap_or(false) {
+            println!("        · 已注册开机启动：登录后会由 winmem-gui.exe 自动开启监测");
+        }
     }
 
     println!();
@@ -1057,10 +1358,10 @@ fn cmd_auto(opts: &HashMap<String, String>) {
     );
     println!(
         "  开机自动启动：{}",
-        if cfg.start_with_windows {
-            "已开启"
-        } else {
-            "已关闭（默认）"
+        match win::autostart_enabled() {
+            Ok(true) => "已注册（实际状态）".to_string(),
+            Ok(false) => "未注册（默认）".to_string(),
+            Err(e) => format!("查询失败（{}）", e),
         }
     );
     println!("  采样间隔：{} 秒", cfg.policy.sample_interval_secs);
@@ -1071,16 +1372,20 @@ fn cmd_auto(opts: &HashMap<String, String>) {
         cfg.policy.press_exit_free_ratio * 100.0
     );
     println!(
-        "  每批 {} 个（上限 {} 个/次），单进程冷却 {} 秒",
-        cfg.policy.batch_size, cfg.policy.run_budget, cfg.policy.cooldown_secs
+        "  每批 {} 个（单次上限 {} 个，会话预算 {} 个），单进程冷却 {} 秒",
+        cfg.policy.batch_size,
+        cfg.policy.run_budget,
+        cfg.policy.run_budget.saturating_mul(3),
+        cfg.policy.cooldown_secs
     );
+    println!("  效果跟踪节点：{:?} 秒", cfg.policy.track_secs);
     println!();
     println!("{}用法：{}", term::DIM, term::RESET);
-    println!("  winmem auto --on                    开启");
-    println!("  winmem auto --off                   关闭");
-    println!("  winmem auto --allow a.exe,b.exe     设置允许名单");
+    println!("  winmem auto --on                    开启（仅保存配置）");
+    println!("  winmem auto --off                   关闭（立即取消运行中的会话）");
+    println!("  winmem auto --allow a.exe,b.exe     追加允许名单");
     println!("  winmem auto --clear-allow           清空允许名单（只监测）");
-    println!("  winmem auto --startup on|off        开机自动启动");
+    println!("  winmem auto --startup on|off        注册/撤销开机启动");
     println!("  winmem auto --run                   前台运行自动会话");
 }
 
@@ -1093,22 +1398,24 @@ fn fmt_opt(v: Option<u64>) -> String {
         .unwrap_or_else(|| report::UNKNOWN.into())
 }
 
-fn cmd_sysmem(rest: &[String]) {
-    let sub = rest
-        .first()
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    match sub.as_str() {
-        "" | "status" => sysmem_report(),
-        "compression" | "compress" => sysmem_change(sysmem::ChangeKind::MemoryCompression, rest),
-        "combining" => sysmem_change(sysmem::ChangeKind::PageCombining, rest),
-        "pagefile" => sysmem_change(sysmem::ChangeKind::AutomaticPagefile, rest),
-        "restore" => sysmem_restore(rest),
-        "history" => sysmem_history(),
-        other => {
-            eprintln!("{}未知子命令：{}{}", term::RED, other, term::RESET);
-            println!("可用：status / compression / combining / pagefile / restore / history");
-        }
+/// 分页文件「自动管理」开关的展示文案。
+///
+/// 只有明确的布尔值才翻译成「系统自动管理 / 手动配置」；
+/// 不支持 / 不可用 / 查询失败保持原语义，绝不当成「已关闭」。
+fn automatic_label(s: &sysmem::Snapshot) -> String {
+    match s {
+        sysmem::Snapshot::Bool(true) => "系统自动管理".into(),
+        sysmem::Snapshot::Bool(false) => "手动配置".into(),
+        other => other.describe(),
+    }
+}
+
+fn cmd_sysmem(cmd: SysmemCmd) {
+    match cmd {
+        SysmemCmd::Status => sysmem_report(),
+        SysmemCmd::Change { kind, action } => sysmem_change(change_kind(kind), action),
+        SysmemCmd::Restore { kind } => sysmem_restore(kind),
+        SysmemCmd::History => sysmem_history(),
     }
 }
 
@@ -1151,33 +1458,19 @@ fn sysmem_report() {
         None => println!("  提交量     {}", report::UNKNOWN),
     }
 
-    println!(
-        "  内存压缩   {}",
-        sysmem::describe_bool(&comp.memory_compression)
-    );
+    println!("  内存压缩   {}", comp.memory_compression.describe());
     println!("     说明：部分页面压缩后留在物理内存，可减少磁盘换入，但需要 CPU 处理。");
-    println!(
-        "  页面合并   {}",
-        sysmem::describe_bool(&comp.page_combining)
-    );
+    println!("  页面合并   {}", comp.page_combining.describe());
     println!(
         "     说明：Windows 可合并内容相同的物理页面，收益取决于重复页面与负载，存在处理开销。"
     );
+    println!("  分页文件   {}", automatic_label(&pf.automatic_managed));
     println!(
-        "  分页文件   {}",
-        match &pf.automatic_managed {
-            sysmem::Probe::Value(true) => "系统自动管理".to_string(),
-            sysmem::Probe::Value(false) => "手动配置".to_string(),
-            other => format!(
-                "{}（{}）",
-                other.label(),
-                match other {
-                    sysmem::Probe::NotSupported => "当前系统不支持查询".to_string(),
-                    sysmem::Probe::Unavailable(w) | sysmem::Probe::Failed(w) => w.clone(),
-                    sysmem::Probe::Value(_) => String::new(),
-                }
-            ),
-        }
+        "     自动管理查询：{}；配置项：{}；使用量：{}；卷：{}",
+        automatic_label(&pf.automatic_managed),
+        pf.settings_status.describe(),
+        pf.usage_status.describe(),
+        pf.volume_status.describe()
     );
     for e in &pf.entries {
         println!(
@@ -1254,37 +1547,46 @@ fn sysmem_report() {
         term::RESET
     );
     println!(
-        "{}      winmem sysmem pagefile --enable        启用系统自动管理分页文件{}",
-        term::DIM,
-        term::RESET
-    );
-    println!(
         "{}      winmem sysmem restore                  恢复本工具上次修改前的配置{}",
         term::DIM,
         term::RESET
     );
 }
 
-fn sysmem_change(kind: sysmem::ChangeKind, rest: &[String]) {
-    let enable = rest.iter().any(|s| s == "--enable" || s == "on");
-    let disable = rest.iter().any(|s| s == "--disable" || s == "off");
+/// 变更某项系统配置。
+///
+/// `action = None` 表示用户没有给出 `--enable/--disable`：只显示当前状态与用法，不修改任何设置。
+fn sysmem_change(kind: sysmem::ChangeKind, action: Option<bool>) {
     let before = sysmem::snapshot_of(kind);
 
-    if !enable && !disable {
+    // 无 --enable/--disable：只报告，不修改
+    let Some(action) = action else {
         println!();
-        println!("  {}：{}", kind.title(), before);
-        println!("  用法：winmem sysmem {} --enable | --disable", kind.id());
+        println!("  {}：{}", kind.title(), before.describe());
+        println!(
+            "  用法：winmem sysmem {} --enable | --disable",
+            match kind {
+                sysmem::ChangeKind::MemoryCompression => "compression",
+                sysmem::ChangeKind::PageCombining => "combining",
+                sysmem::ChangeKind::AutomaticPagefile => "pagefile",
+            }
+        );
         return;
-    }
+    };
 
     println!();
     println!("{}即将变更系统配置{}", term::BOLD, term::RESET);
     println!("  项目：{}", kind.title());
-    println!("  当前：{}", before);
-    println!("  目标：{}", if enable { "开启" } else { "关闭" });
+    println!("  当前：{}", before.describe());
+    println!("  目标：{}", if action { "开启" } else { "关闭" });
     println!("  权限：需要管理员权限（本程序只在实际变更时请求，不会自动提权）");
-    if kind.needs_reboot() {
-        println!("  重启：该改动可能需要重启后才能完全生效，届时需要再次检查确认");
+    println!("  重启：{}", kind.reboot_state().label());
+    if !before.is_known() {
+        println!(
+            "{}  注意：当前原状态无法可靠读取，变更后将**无法自动恢复**，请自行记录。{}",
+            term::YELLOW,
+            term::RESET
+        );
     }
     println!(
         "{}  注意：配置改变 ≠ 运行效果已确认；本工具不会宣称一定能改善性能。{}",
@@ -1297,13 +1599,15 @@ fn sysmem_change(kind: sysmem::ChangeKind, rest: &[String]) {
         return;
     }
 
-    let outcome = sysmem::apply_change(kind, enable);
+    let outcome = sysmem::apply_change(kind, action);
     println!();
     if outcome.ok {
         println!("{}{}{}", term::GREEN, outcome.message, term::RESET);
     } else {
         println!("{}{}{}", term::RED, outcome.message, term::RESET);
     }
+    println!("  验证程度：{}", outcome.verify.label());
+    println!("  重启状态：{}", outcome.reboot.label());
     println!("  变更后重新查询：{}", outcome.verified);
     if !sysmem::is_elevated() {
         println!(
@@ -1314,24 +1618,39 @@ fn sysmem_change(kind: sysmem::ChangeKind, rest: &[String]) {
     }
 }
 
-fn sysmem_restore(rest: &[String]) {
-    let kind = match rest.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
-        Some("compression") | None => sysmem::ChangeKind::MemoryCompression,
-        Some("combining") => sysmem::ChangeKind::PageCombining,
-        Some("pagefile") => sysmem::ChangeKind::AutomaticPagefile,
-        Some(other) => {
-            eprintln!("{}未知配置项：{}{}", term::RED, other, term::RESET);
-            return;
-        }
+fn sysmem_restore(kind: Option<Change>) {
+    let kinds: Vec<sysmem::ChangeKind> = match kind {
+        Some(c) => vec![change_kind(c)],
+        None => vec![
+            sysmem::ChangeKind::MemoryCompression,
+            sysmem::ChangeKind::PageCombining,
+            sysmem::ChangeKind::AutomaticPagefile,
+        ],
     };
-    let outcome = sysmem::restore_last(kind);
-    println!();
-    if outcome.ok {
-        println!("{}{}{}", term::GREEN, outcome.message, term::RESET);
-    } else {
-        println!("{}{}{}", term::YELLOW, outcome.message, term::RESET);
+    for k in kinds {
+        let outcome = sysmem::restore_last(k);
+        println!();
+        println!("{}恢复 {}：{}", term::BOLD, k.title(), term::RESET);
+        if outcome.ok {
+            println!("{}{}{}", term::GREEN, outcome.message, term::RESET);
+        } else {
+            println!("{}{}{}", term::YELLOW, outcome.message, term::RESET);
+        }
+        println!("  验证程度：{}", outcome.verify.label());
+        println!("  当前状态：{}", outcome.verified);
+
+        // 分页文件无法可靠恢复时，直接打开系统设置，并明确说明限制
+        if !outcome.ok && k == sysmem::ChangeKind::AutomaticPagefile {
+            println!(
+                "{}正在打开系统「虚拟内存」设置；本工具不会替你覆盖无法确认的配置。{}",
+                term::DIM,
+                term::RESET
+            );
+            if let Err(e) = sysmem::open_pagefile_settings() {
+                println!("  （无法打开系统设置：{}）", e);
+            }
+        }
     }
-    println!("  当前状态：{}", outcome.verified);
 }
 
 fn sysmem_history() {
@@ -1346,8 +1665,8 @@ fn sysmem_history() {
         println!(
             "  {}：{} → {}（结果 {}，验证：{}{}）",
             c.kind,
-            c.before,
-            c.target,
+            c.before.describe(),
+            c.target.describe(),
             c.result,
             c.verified,
             if c.reboot_required {
@@ -1356,6 +1675,20 @@ fn sysmem_history() {
                 ""
             }
         );
+        if !c.target_entries.is_empty() {
+            for e in &c.target_entries {
+                println!(
+                    "    分页文件项：{}（初始 {} / 最大 {}）",
+                    e.path,
+                    e.initial_mb
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "系统决定".into()),
+                    e.maximum_mb
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "系统决定".into())
+                );
+            }
+        }
     }
     if let Some(p) = sysmem::history_path() {
         println!();

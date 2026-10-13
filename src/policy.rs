@@ -233,8 +233,9 @@ pub fn decide(input: &PolicyInput<'_>) -> Verdict {
             soft.push(Reason::Busy);
         }
     }
-    // 活动指标未知时，无法区分「闲置」与「正在工作」；自动模式必须保守跳过。
-    if !input.purpose.is_manual() && f.cpu_percent.is_none() {
+    // 活动指标未知时，无法区分「闲置」与「正在工作」：
+    // 自动模式必须保守跳过；手动模式下保留为警告（已由下面按意图处理）。
+    if f.cpu_percent.is_none() {
         soft.push(Reason::UnknownActivity);
     }
     if f.cooling {

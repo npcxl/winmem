@@ -234,8 +234,7 @@ impl ProcessSampler {
                                 if let (Some(t), Some(pc)) = (cpu_time, p.cpu_time) {
                                     let d = t.saturating_sub(pc);
                                     // CPU 时间单位为 100ns
-                                    m.cpu_percent =
-                                        Some(d as f64 / 10_000.0 / dt as f64 * 100.0);
+                                    m.cpu_percent = Some(d as f64 / 10_000.0 / dt as f64 * 100.0);
                                 }
                                 if let (Some(io), Some(pio)) = (io_total, p.io_bytes) {
                                     m.io_active = Some(io.saturating_sub(pio) > 0);
@@ -299,7 +298,8 @@ impl ForegroundTracker {
         self.current = pid;
         if let Some(p) = pid {
             if let Ok(id) = win::ProcessIdentity::query(p) {
-                self.last_identity.insert((id.pid, id.creation_time), now_secs);
+                self.last_identity
+                    .insert((id.pid, id.creation_time), now_secs);
             }
             if let Ok(h) = win::open_handle(p, win::PROCESS_QUERY_LIMITED_INFORMATION) {
                 if let Ok(path) = win::process_path(h.raw()) {
@@ -367,9 +367,15 @@ mod tests {
         // 身份一致 → 有年龄
         assert_eq!(t.age_secs(100, Some(111), None, 1010), Some(10));
         // 身份不一致（PID 复用）但映像路径一致 → 按同应用保护
-        assert_eq!(t.age_secs(100, Some(999), Some(r"C:\APP\A.EXE"), 1010), Some(10));
+        assert_eq!(
+            t.age_secs(100, Some(999), Some(r"C:\APP\A.EXE"), 1010),
+            Some(10)
+        );
         // 都不匹配 → 未知
-        assert_eq!(t.age_secs(100, Some(999), Some(r"C:\other\b.exe"), 1010), None);
+        assert_eq!(
+            t.age_secs(100, Some(999), Some(r"C:\other\b.exe"), 1010),
+            None
+        );
         // 没有创建时间且没有路径 → 未知（不会盲目认为“刚用过”）
         assert_eq!(t.age_secs(100, None, None, 1010), None);
     }

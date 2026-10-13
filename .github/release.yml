@@ -1,0 +1,37 @@
+# GitHub Release 自动生成的变更分类规则。
+# 与 `gh release create --generate-notes`（见 .github/workflows/release.yml）配合使用。
+# 依据 PR 的标签把变更分到不同小节；未匹配到任何分类的变更进入「其他变更」。
+
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+      - duplicate
+      - invalid
+    authors:
+      - dependabot
+      - github-actions
+  categories:
+    - title: 新增功能
+      labels:
+        - enhancement
+        - feature
+    - title: 缺陷修复
+      labels:
+        - bug
+        - fix
+    - title: 安全与稳定性
+      labels:
+        - security
+        - stability
+    - title: 文档
+      labels:
+        - documentation
+        - docs
+    - title: 构建与发布
+      labels:
+        - ci
+        - build
+    - title: 其他变更
+      labels:
+        - "*"

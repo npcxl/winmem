@@ -81,10 +81,28 @@ jobs:
             throw "标签与 Cargo.toml 版本不一致：标签 $tag，Cargo.toml $cargoVersion"
           }
 
-          # 该 tag 是否已经发布过？已经发布则本次跳过（重复推送是安全的）
+          # 该 tag 是否已经**完整**发布过？只有资产齐全才跳过（重复推送是安全的）。
+          # 若 Release 存在但资产缺失（例如上次上传中途失败），本次需要补传。
+          if (Test-Path variable:\PSNativeCommandUseErrorActionPreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+          }
           $already = $false
           gh release view $tag --repo "${{ github.repository }}" 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) { $already = $true }
+          if ($LASTEXITCODE -eq 0) {
+            $have = @(gh release view $tag --repo "${{ github.repository }}" --json assets -q '.assets[].name' 2>$null)
+            $need = @(
+              "$env:ZIP_NAME", "$env:ZIP_NAME.sha256",
+              "winmem.exe", "winmem.exe.sha256",
+              "winmem-gui.exe", "winmem-gui.exe.sha256",
+              "latest.json"
+            )
+            $missing = @($need | Where-Object { $have -notcontains $_ })
+            if ($missing.Count -eq 0) {
+              $already = $true
+            } else {
+              Write-Host "Release $tag 已存在但缺少资产：$($missing -join ', ')；本次将补传。"
+            }
+          }
 
           if (-not $already) {
             $exists = (git rev-parse -q --verify "refs/tags/$tag") -ne $null
@@ -184,35 +202,78 @@ jobs:
       - name: 打包并生成校验和
         shell: pwsh
         run: |
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          # 侧车校验和文件必须与它描述的文件放在**同一目录**：
+          # 之前用 Split-Path -Leaf 把 "dist/winmem.exe" 变成 "winmem.exe"，
+          # 导致 .sha256 落在仓库根目录，随后的 gh release create 找不到
+          # dist/winmem.exe.sha256 而以 “no matches found for …” 失败。
+          $targets = @("dist/winmem.exe", "dist/winmem-gui.exe", $env:ZIP_NAME)
+
           Compress-Archive -Path dist/* -DestinationPath $env:ZIP_NAME -Force
-          foreach ($f in @($env:ZIP_NAME, "dist/winmem.exe", "dist/winmem-gui.exe")) {
+
+          foreach ($f in $targets) {
+            if (-not (Test-Path $f)) { throw "找不到待校验的文件：$f" }
             $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
-            "$hash  $(Split-Path $f -Leaf)" |
-              Out-File -Encoding ascii "$(Split-Path $f -Leaf).sha256"
-            Write-Host "$(Split-Path $f -Leaf)  SHA256=$hash"
+            # 与目标文件同目录：dist/winmem.exe → dist/winmem.exe.sha256
+            [System.IO.File]::WriteAllText("$f.sha256", "$hash  $(Split-Path $f -Leaf)`n", $utf8)
+            Write-Host "$f  SHA256=$hash"
           }
 
-      - name: 创建 GitHub Release
+          # 让日志能直接看到四个侧车文件确实生成在预期位置
+          foreach ($f in $targets) {
+            if (-not (Test-Path "$f.sha256")) { throw "校验和文件未生成：$f.sha256" }
+            Write-Host "已生成：$f.sha256"
+          }
+
+      - name: 创建或补齐 GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "${{ needs.resolve.outputs.tag }}"
-          $args = @(
-            "release", "create", $tag,
+          # 原生命令的退出码由我们自己检查，避免 probe 失败时直接抛异常
+          if (Test-Path variable:\PSNativeCommandUseErrorActionPreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+          }
+          $ErrorActionPreference = "Stop"
+
+          $tag  = "${{ needs.resolve.outputs.tag }}"
+          $repo = "${{ github.repository }}"
+          $files = @(
             "$env:ZIP_NAME", "$env:ZIP_NAME.sha256",
             "dist/winmem.exe", "dist/winmem.exe.sha256",
-            "dist/winmem-gui.exe", "dist/winmem-gui.exe.sha256",
-            "--title", "winmem $tag",
-            "--generate-notes"
+            "dist/winmem-gui.exe", "dist/winmem-gui.exe.sha256"
           )
-          if ("${{ needs.resolve.outputs.prerelease }}" -eq "true") { $args += "--prerelease" }
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            # 手动触发：先建草稿，人工确认后再公开
-            $args += "--draft"
+
+          # 先确认所有上传资产都在本地存在，避免 gh 报含糊的 “no matches found for”
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { throw "发布资产不存在：$f（请检查上游步骤是否成功）" }
+            $size = (Get-Item $f).Length
+            Write-Host "资产就绪：$f（$size 字节）"
           }
-          gh @args
-          Write-Host "`nRelease 已创建：$tag"
+
+          # Release 已存在（例如上次只建了 Release、资产没传完）则改为补传，保证可重复执行
+          gh release view $tag --repo $repo 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag 已存在，改为补传 / 覆盖资产。"
+            gh release upload $tag @files --repo $repo --clobber
+            if ($LASTEXITCODE -ne 0) { throw "上传资产失败（gh 退出码 $LASTEXITCODE）" }
+          } else {
+            $args = @("release", "create", $tag) + $files + @(
+              "--repo", $repo,
+              "--title", "winmem $tag",
+              "--generate-notes"
+            )
+            if ("${{ needs.resolve.outputs.prerelease }}" -eq "true") { $args += "--prerelease" }
+            if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+              # 手动触发：先建草稿，人工确认后再公开
+              $args += "--draft"
+            }
+            gh @args
+            if ($LASTEXITCODE -ne 0) { throw "创建 Release 失败（gh 退出码 $LASTEXITCODE）" }
+          }
+
+          Write-Host "Release 已就绪：$tag"
 
       - name: 生成热更新清单 latest.json
         shell: pwsh
@@ -252,6 +313,7 @@ jobs:
           Get-Content latest.json
 
           gh release upload $tag latest.json --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw "上传 latest.json 失败（gh 退出码 $LASTEXITCODE）" }
           Write-Host "已上传 latest.json（客户端通过 releases/latest/download/latest.json 获取）"
 
       - name: 上传工作流产物

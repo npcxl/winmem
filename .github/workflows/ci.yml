@@ -67,6 +67,13 @@ jobs:
         shell: pwsh
         run: .\target\release\winmem-gui.exe --bench 10
 
+      # 更新检查要联网、且要求仓库已有正式 Release，因此只做冒烟，不阻挡 CI
+      - name: 热更新检查冒烟（可失败，仅记录）
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: pwsh
+        run: .\target\release\winmem.exe update --check
+
       - name: 上传自检报告
         if: always()
         uses: actions/upload-artifact@v4

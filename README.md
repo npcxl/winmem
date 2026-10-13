@@ -128,13 +128,18 @@ winmem kill --name chrome.exe [--force] [--yes]
 - 与「工作集大小」「CPU 活跃度」无关的原因（如工作集过小）**不会**阻挡手动结束进程；
 - 默认需要交互确认，`--yes` 用于脚本。
 
-### config / history
+### config / update / history
 
 ```
 winmem config --init          # 生成配置模板
+winmem config --template      # 只把模板打印到标准输出（不写文件）
 winmem config                 # 查看当前生效值
+winmem update --check         # 检查更新（只读，不下载）
+winmem update                 # 下载 → 校验 SHA-256 → 替换自身（重启后生效）
 winmem history                # 查看最近操作记录
 ```
+
+`update` 的完整说明见第十六节。
 
 ---
 
@@ -211,6 +216,8 @@ allow = mygame.exe, blender.exe    # 自动优化允许名单
 auto_enabled = false               # 是否允许 monitor --auto 执行
 auto_allow_unlisted = false        # 是否允许自动处理未列入 allow 的进程
 minimize_to_tray = true            # 关闭窗口时收进托盘而不是退出
+auto_update_check = true           # 启动时后台检查更新（只提示，不安装）
+update_repo = npcxl/winmem         # 更新源仓库（owner/name）
 press_enter_free_ratio = 0.1
 press_hold_secs = 30
 batch_size = 2
@@ -270,9 +277,11 @@ winmem/
 │   ├── config.rs         # 用户配置、保护/允许名单
 │   ├── report.rs         # 报告格式化与历史
 │   ├── term.rs           # 终端渲染
+│   ├── update.rs         # 热更新（版本比较、WinHTTP 下载、SHA-256 校验、自替换回滚）
 │   ├── main.rs           # CLI
 │   └── bin/winmem-gui/   # 图形界面（Win32 + GDI，零依赖）
 ├── tests/integration.rs  # Windows 集成测试（只操作自建测试子进程）
+├── .github/workflows/    # CI（fmt/clippy/test/构建校验）与 Release（自动发版 + latest.json）
 ├── winmem.manifest       # 启用 Common Controls 6.0（跟随系统视觉样式）
 └── build.rs
 ```
@@ -428,6 +437,131 @@ winmem sysmem history                          # 变更记录
 页面上的「打开 Windows 虚拟内存设置」「恢复上次配置…」是**需要用户手动确认**的系统配置变更（需管理员，可能需重启）。
 
 界面上的三件事保持清晰区分：**只读诊断**（系统内存页）、**需要手动执行的系统配置变更**（sysmem 命令 / 需管理员）、**自动优化的运行状态**（开关与状态标签）。
+
+---
+
+## 十六、热更新
+
+程序可以自己检查新版本、下载、校验并替换自身，用户不需要手动下载安装包。
+
+```text
+winmem update --check              # 只看有没有新版本，不下载
+winmem update                      # 检查 → 询问确认 → 下载 → 校验 → 替换
+winmem update --yes                # 跳过确认（脚本用）
+winmem update --yes --restart      # 装完自动重启
+winmem update --repo owner/fork    # 换一个更新源仓库
+```
+
+图形界面：**右键菜单 → 「检查更新…」**。启动时还会按配置做一次**静默检查**——发现新版本只在状态栏留一行提示，不弹窗、不抢焦点、不打断工作；是否安装完全由你决定。
+
+### 工作原理
+
+版本清单 `latest.json` 随每个 Release 一起发布，客户端通过
+
+```text
+https://github.com/<repo>/releases/latest/download/latest.json
+```
+
+获取。走的是 Release 资源直链而不是 GitHub API，因此**无需令牌、不受 API 限流影响**，并且天然只会拿到**正式版本**（预发布版不会成为 latest）。
+
+清单里给出了每个文件的下载地址与 SHA-256：
+
+```json
+{
+  "schema": 1,
+  "tag": "v0.2.0",
+  "version": "0.2.0",
+  "notes": "本次更新说明",
+  "assets": [
+    { "name": "winmem.exe", "url": "...", "sha256": "...", "size": 488448 }
+  ]
+}
+```
+
+因此热更新**不需要解压 zip**：直接下载与自身同名的 exe 即可。
+
+### 安全设计
+
+| 环节 | 做法 |
+| --- | --- |
+| 传输 | 系统自带 **WinHTTP**（TLS、证书校验、超时、自动跟随重定向），不引入第三方网络库 |
+| 完整性 | 下载后**必须**校验 SHA-256；清单缺失校验和或校验不通过时**直接放弃安装**，不写任何文件 |
+| 原子性 | 新文件先写到目标同目录的 `*.exe.new`（同一卷内改名是原子操作） |
+| 可回滚 | 旧文件改名为 `*.exe.old`；新文件就位失败会**自动把备份改回原名** |
+| 可恢复 | `*.old` 在下次启动时自动清理；旧进程还没退出导致删不掉时留到下次再试 |
+| 不静默 | 下载与安装**必须**经用户确认；自动检查只提示不安装（`auto_update_check = false` 可完全关闭） |
+| 不提权 | 目录不可写时报错并提示「以管理员身份运行」，不会偷偷弹 UAC |
+
+**为什么可以直接替换正在运行的程序？** Windows 允许**重命名**正在运行的 exe（只是不允许删除），所以流程是「旧文件改名 → 新文件就位」，不需要任何常驻的「更新器」辅助进程。
+
+命令行与图形界面共享同一套实现：更新 `winmem.exe` 时会顺带更新同目录的 `winmem-gui.exe`，两者始终来自同一个 Release，不会出现版本错配。
+
+### 相关配置
+
+```ini
+auto_update_check = true      # 启动时后台检查（只提示，不安装）
+update_repo = npcxl/winmem    # 更新源仓库
+last_update_check = 0         # 上次检查时间戳，程序自己维护
+```
+
+### 已知限制
+
+- 更新源仓库必须是**公开**的（匿名读取 Release 资源）；私有仓库需要自行提供带认证的下载通道。
+- 需要替换的是 `winmem.exe` / `winmem-gui.exe` 本身，因此安装目录必须可写（放在 `Program Files` 下需管理员权限）。
+- 替换后需**重启程序**才生效——本工具不做「进程内自我升级」这种不稳定的事。
+
+---
+
+## 十七、发布流程（CI/CD）
+
+### 你只需要改版本号然后 push
+
+```text
+1. 改 Cargo.toml 里的 version（例如 0.1.0 → 0.2.0）
+2. git commit -am "chore: 发布 v0.2.0"
+3. git push origin main
+```
+
+推送到 `main` 后 GitHub Actions 会自动：
+
+1. 读取 `Cargo.toml` 的版本号，得到目标标签 `v0.2.0`；
+2. 校验标签与版本号一致（不一致直接失败，避免发错版本）；
+3. 若该标签不存在则创建并推送；
+4. 用**该标签对应的提交**构建 release；
+5. 组装发布包（两个 exe、README、示例配置、使用说明）；
+6. 为 zip 与两个 exe 各生成 SHA-256；
+7. 创建 GitHub Release（自动生成分类变更说明）；
+8. 生成并上传 `latest.json`。
+
+客户端下次检查更新时就能看到新版本。**标签已存在且发布过时会自动跳过**，所以重复推送是安全的，发布失败后重推也能自动补发。
+
+### 三种触发方式
+
+| 方式 | 场景 |
+| --- | --- |
+| 改版本号 push 到 `main` | 日常发布（推荐） |
+| `git tag v0.2.0 && git push origin v0.2.0` | 指定提交发布、补发历史版本 |
+| 手动触发 workflow 并填写 `tag` | 重发已有标签；产物先作为**草稿**，人工确认后再公开 |
+
+### 工作流文件
+
+```text
+.github/workflows/ci.yml       每次 push / PR：fmt → clippy(-D warnings) → test → release 构建校验，
+                               并跑一次 --bench 自检，把实测开销留在构建日志里
+.github/workflows/release.yml  resolve（版本与标签判定）+ release（构建、打包、发布、生成 latest.json）
+.github/release.yml            Release 说明的分类规则（按 PR 标签分组）
+```
+
+### 自定义更新源
+
+`latest.json` 是唯一约定的接口。若你想自建分发（内网镜像、私有对象存储）：
+
+```text
+winmem update --repo your/name                      # 换仓库
+set WINMEM_UPDATE_BASE=https://mirror.example       # 换基址（替代 https://github.com）
+```
+
+只要在对应地址提供同样 schema 的 `latest.json` 与可下载文件即可，客户端无需改动。
 
 ---
 
